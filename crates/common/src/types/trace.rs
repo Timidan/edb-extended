@@ -193,6 +193,10 @@ where
 pub struct Trace {
     /// Internal vector storing all trace entries in chronological order
     inner: Vec<TraceEntry>,
+    /// Total gas used by the transaction (from ExecutionResult, includes refunds)
+    /// This is the authoritative gas value that should be used for reporting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_gas_used: Option<u64>,
 }
 
 impl Deref for Trace {
@@ -234,6 +238,16 @@ impl Trace {
     /// Check if the trace is empty
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Set the total gas used from ExecutionResult (includes refunds)
+    pub fn set_total_gas_used(&mut self, gas: u64) {
+        self.total_gas_used = Some(gas);
+    }
+
+    /// Get the total gas used (if set from ExecutionResult)
+    pub fn get_total_gas_used(&self) -> Option<u64> {
+        self.total_gas_used
     }
 }
 
@@ -287,6 +301,8 @@ pub struct TraceEntry {
     pub value: U256,
     /// Result of the call (populated on call_end)
     pub result: Option<CallResult>,
+    /// Gas used by this call (populated on call_end from REVM outcome)
+    pub gas_used: Option<u64>,
     /// Whether this created a new contract
     pub created_contract: bool,
     /// Create scheme for contract creation
@@ -686,6 +702,7 @@ mod tests {
                 output: Bytes::from_static(b"return_data"),
                 result: InstructionResult::Return,
             }),
+            gas_used: Some(21000),
             created_contract: false,
             create_scheme: None,
             bytecode: Some(Bytes::from(hex::decode("60806040").unwrap())),
@@ -709,6 +726,7 @@ mod tests {
         assert_eq!(deserialized.input, entry.input);
         assert_eq!(deserialized.value, entry.value);
         assert_eq!(deserialized.result, entry.result);
+        assert_eq!(deserialized.gas_used, entry.gas_used);
         assert_eq!(deserialized.created_contract, entry.created_contract);
         assert_eq!(deserialized.create_scheme, entry.create_scheme);
         assert_eq!(deserialized.bytecode, entry.bytecode);
@@ -739,6 +757,7 @@ mod tests {
                 output: Bytes::from_static(b"return_data"),
                 result: InstructionResult::Return,
             }),
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: Some(bytecode),
@@ -823,6 +842,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: None,
@@ -858,6 +878,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: None,
@@ -877,6 +898,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: true,
             create_scheme: Some(CreateScheme::Create),
             bytecode: None,
@@ -925,6 +947,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: None,
@@ -947,6 +970,7 @@ mod tests {
                 input: Bytes::new(),
                 value: U256::ZERO,
                 result: None,
+                gas_used: None,
                 created_contract: false,
                 create_scheme: None,
                 bytecode: None,
@@ -995,6 +1019,7 @@ mod tests {
                     output: Bytes::from_static(b"success"),
                     result: InstructionResult::Return,
                 }),
+                gas_used: Some(1000),
                 created_contract: false,
                 create_scheme: None,
                 bytecode: None,
@@ -1033,6 +1058,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: None,
@@ -1064,6 +1090,7 @@ mod tests {
             input: Bytes::new(),
             value: U256::ZERO,
             result: None,
+            gas_used: None,
             created_contract: false,
             create_scheme: None,
             bytecode: None,

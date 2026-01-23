@@ -149,6 +149,62 @@ pub struct OpcodeSnapshotInfoDetail {
     /// Transient storage state for EIP-1153 temporary storage operations
     #[serde(with = "transient_string_map")]
     pub transient_storage: TransientStorage,
+    /// Gas remaining before executing this opcode
+    pub gas_remaining: u64,
+    /// Optional storage read information for this opcode (SLOAD)
+    pub storage_read: Option<StorageAccess>,
+    /// Optional storage write information for this opcode (SSTORE)
+    pub storage_write: Option<StorageWrite>,
+}
+
+/// Storage access for SLOAD
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageAccess {
+    pub slot: U256,
+    pub value: U256,
+}
+
+/// Storage write for SSTORE (before/after)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageWrite {
+    pub slot: U256,
+    pub before: U256,
+    pub after: U256,
+}
+
+/// Lightweight opcode entry for trace display (without full state)
+/// This is used for the UI trace view where we need to show opcodes
+/// but don't need the full database state, memory, or complete stack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightweightOpcodeEntry {
+    /// Snapshot ID for fetching full details on demand
+    pub id: usize,
+    /// Execution frame this opcode belongs to
+    pub frame_id: ExecutionFrameId,
+    /// Program counter
+    pub pc: usize,
+    /// Opcode byte value
+    pub opcode: u8,
+    /// Gas remaining before this opcode
+    pub gas_remaining: u64,
+    /// Gas used by this opcode (computed from next snapshot)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<u64>,
+    /// Target address for this execution
+    pub target_address: Address,
+    /// Bytecode address (may differ from target in proxies)
+    pub bytecode_address: Address,
+    /// Storage read for SLOAD
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_read: Option<StorageAccess>,
+    /// Storage write for SSTORE
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_write: Option<StorageWrite>,
+    /// Top of stack (for quick inspection)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack_top: Option<U256>,
+    /// Stack depth
+    pub stack_depth: usize,
 }
 
 /// Custom serialization module for transient storage

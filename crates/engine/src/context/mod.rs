@@ -80,6 +80,19 @@ use tracing::{debug, error};
 
 use crate::{analysis::AnalysisResult, Artifact, SnapshotDetail, Snapshots};
 
+/// Options controlling EngineContext finalization behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeOptions {
+    /// Precompute state variables for hook snapshots.
+    pub precompute_state_variables: bool,
+}
+
+impl Default for FinalizeOptions {
+    fn default() -> Self {
+        Self { precompute_state_variables: true }
+    }
+}
+
 /// Complete debugging context containing all analysis results and state snapshots
 ///
 /// This struct encapsulates all the data produced during the debugging workflow,
@@ -158,6 +171,36 @@ where
         analysis_results: HashMap<Address, AnalysisResult>,
         trace: Trace,
     ) -> Result<Self> {
+        Self::build_with_options(
+            fork_info,
+            cfg,
+            block,
+            tx,
+            tx_hash,
+            snapshots,
+            artifacts,
+            recompiled_artifacts,
+            analysis_results,
+            trace,
+            FinalizeOptions::default(),
+        )
+    }
+
+    /// Build a new EngineContext with explicit finalization options.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_options(
+        fork_info: ForkInfo,
+        cfg: CfgEnv,
+        block: BlockEnv,
+        tx: TxEnv,
+        tx_hash: TxHash,
+        snapshots: Snapshots<DB>,
+        artifacts: HashMap<Address, Artifact>,
+        recompiled_artifacts: HashMap<Address, Artifact>,
+        analysis_results: HashMap<Address, AnalysisResult>,
+        trace: Trace,
+        finalize_options: FinalizeOptions,
+    ) -> Result<Self> {
         let mut context = Self {
             fork_info,
             cfg,
@@ -173,7 +216,7 @@ where
         };
 
         // Finalize the context to populate derived fields
-        context.finalize()?;
+        context.finalize_with_options(finalize_options)?;
         Ok(context)
     }
 
@@ -184,9 +227,14 @@ where
     /// 2. Pre-evaluates state variables for all hook-based snapshots
     /// 3. Populates derived mappings for efficient lookups
     fn finalize(&mut self) -> Result<()> {
-        self.finalize_trace()?;
-        self.finalize_snapshots()?;
+        self.finalize_with_options(FinalizeOptions::default())
+    }
 
+    fn finalize_with_options(&mut self, options: FinalizeOptions) -> Result<()> {
+        self.finalize_trace()?;
+        if options.precompute_state_variables {
+            self.finalize_snapshots()?;
+        }
         Ok(())
     }
 

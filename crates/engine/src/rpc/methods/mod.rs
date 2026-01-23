@@ -24,6 +24,7 @@
 //! ## Artifact Management ([`artifact`])
 //! - `edb_getCode` - Retrieve contract bytecode
 //! - `edb_getConstructorArgs` - Get constructor arguments
+//! - `edb_getStorageLayout` - Get storage layout for struct field inspection
 //!
 //! ## Expression Evaluation ([`expr`])
 //! - `edb_evalOnSnapshot` - Evaluate expressions against snapshots
@@ -110,8 +111,11 @@ where
             "edb_getCode" => artifact::get_code(&self.context, params),
             "edb_getCodeByAddress" => artifact::get_code_by_address(&self.context, params),
             "edb_getConstructorArgs" => artifact::get_constructor_args(&self.context, params),
+            "edb_getArtifactByAddress" => artifact::get_artifact_by_address(&self.context, params),
+            "edb_getStorageLayout" => artifact::get_storage_layout(&self.context, params),
             "edb_getSnapshotCount" => snapshot::get_snapshot_count(&self.context),
             "edb_getSnapshotInfo" => snapshot::get_snapshot_info(&self.context, params),
+            "edb_getOpcodeTrace" => snapshot::get_opcode_trace(&self.context),
             "edb_getContractABI" => resolve::get_contract_abi(&self.context, params),
             "edb_getCallableABI" => resolve::get_callable_abi(&self.context, params),
             "edb_getNextCall" => navigation::get_next_call(&self.context, params),

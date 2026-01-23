@@ -2160,6 +2160,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "edb-simulator"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types",
+ "edb-common",
+ "edb-engine",
+ "eyre",
+ "foundry-block-explorers",
+ "foundry-compilers",
+ "reqwest",
+ "revm",
+ "semver 1.0.27",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+]
+
+[[package]]
 name = "edb-tui"
 version = "0.0.2"
 dependencies = [
@@ -5969,8 +5993,6 @@ dependencies = [
 [[package]]
 name = "svm-rs-builds"
 version = "0.5.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c643d522c474be805787a2813b89a179d71afec3540b18d79c5936d9c24bf3e5"
 dependencies = [
  "const-hex",
  "semver 1.0.27",

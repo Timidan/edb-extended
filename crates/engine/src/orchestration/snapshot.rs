@@ -57,7 +57,8 @@ where
 
     let snapshots = inspector.into_snapshots();
 
-    snapshots.print_summary();
+    // Disabled: causes stdout pollution for simulator
+    // snapshots.print_summary();
 
     Ok(snapshots)
 }
@@ -115,7 +116,8 @@ where
 
     let snapshots = inspector.into_snapshots();
 
-    snapshots.print_summary();
+    // Disabled: causes stdout pollution for simulator
+    // snapshots.print_summary();
 
     Ok(snapshots)
 }
@@ -134,7 +136,8 @@ where
     info!("Merging opcode-level and hook-level snapshots");
 
     let snapshots = Snapshots::merge(opcode_snapshots, hook_snapshots);
-    snapshots.print_summary();
+    // Disabled: causes stdout pollution for simulator
+    // snapshots.print_summary();
 
     Ok(snapshots)
 }

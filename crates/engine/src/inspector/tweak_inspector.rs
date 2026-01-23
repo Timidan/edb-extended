@@ -396,8 +396,6 @@ where
                 if let Some(created_address) = outcome.address {
                     if created_address == self.target_address {
                         // Get deployed code from outcome's output (runtime bytecode)
-                        // self.deployed_code =
-                        //     context.load_account_code(created_address).map(|c| c.data.clone());
                         self.deployed_code = Some(outcome.result.output.clone());
                         info!(
                             "Successfully captured deployed bytecode for {:?}: {} bytes",

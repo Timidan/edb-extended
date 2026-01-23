@@ -49,9 +49,11 @@
 use std::{collections::HashSet, sync::Arc};
 
 use alloy_dyn_abi::DynSolValue;
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use edb_common::types::{parse_callable_abi_entries, CallableAbiEntry, TraceEntry};
 use eyre::{bail, eyre, Result};
+use foundry_compilers::artifacts::StorageLayout;
+use serde_json;
 use revm::{database::CacheDB, Database, DatabaseCommit, DatabaseRef};
 use tracing::debug;
 
@@ -83,6 +85,242 @@ fn into_abi_info(value: &DynSolValue) -> Option<CallableAbiEntry> {
         }
     }
     None
+}
+
+/// Read a struct variable from storage by reading all its fields.
+///
+/// This function uses the storage layout's type information to find all struct
+/// members, calculates their storage slots, and reads each field value.
+fn read_struct_from_storage_layout<DB>(
+    type_key: &str,
+    base_slot: U256,
+    storage_layout: &StorageLayout,
+    target_address: Address,
+    snapshot: &Snapshot<DB>,
+) -> Option<DynSolValue>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let type_info = storage_layout.types.get(type_key)?;
+
+    // Get struct members from the "members" field in the type's "other" map
+    let members_value = type_info.other.get("members")?;
+    let members: Vec<serde_json::Value> = serde_json::from_value(members_value.clone()).ok()?;
+
+    if members.is_empty() {
+        return None;
+    }
+
+    let db = snapshot.db();
+    let account = db.cache.accounts.get(&target_address)?;
+
+    let mut field_values: Vec<(String, DynSolValue)> = Vec::new();
+
+    for member in &members {
+        let label = member.get("label")?.as_str()?;
+        let slot_str = member.get("slot")?.as_str()?;
+        let offset = member.get("offset")?.as_i64()? as usize;
+        let member_type_key = member.get("type")?.as_str()?;
+
+        // Get member type info
+        let member_type_info = storage_layout.types.get(member_type_key)?;
+        let member_type_label = &member_type_info.label;
+        let n_bytes: usize = member_type_info.number_of_bytes.parse().ok()?;
+
+        // Calculate actual slot: base_slot + member's relative slot
+        let relative_slot: U256 = slot_str.parse().ok()?;
+        let actual_slot = base_slot + relative_slot;
+
+        // Read storage value
+        let raw_value = account.storage.get(&actual_slot).cloned().unwrap_or_default();
+
+        // Decode the field value
+        let field_value = if member_type_label.starts_with("struct ") {
+            // Recursively handle nested structs
+            read_struct_from_storage_layout(
+                member_type_key,
+                actual_slot,
+                storage_layout,
+                target_address,
+                snapshot,
+            )?
+        } else if member_type_label.starts_with("mapping(") || member_type_label.ends_with("[]") {
+            // For mappings and dynamic arrays, we can't read all values
+            // Return a placeholder indicating the type
+            DynSolValue::String(format!("<{}>", member_type_label))
+        } else {
+            // Elementary type - decode directly
+            decode_storage_value(member_type_label, raw_value, offset, n_bytes)?
+        };
+
+        field_values.push((label.to_string(), field_value));
+    }
+
+    // Build the result - use CustomStruct representation
+    // We'll return a tuple with field names and values that the frontend can interpret
+    let struct_name = type_info.label.strip_prefix("struct ").unwrap_or(&type_info.label);
+
+    // Create a custom struct representation that includes field names
+    // The DynSolValue::CustomStruct would be ideal but it requires additional type info
+    // For now, we'll use a Tuple and let the frontend handle field name mapping
+    let values: Vec<DynSolValue> = field_values.iter().map(|(_, v)| v.clone()).collect();
+    let prop_names: Vec<String> = field_values.iter().map(|(n, _)| n.clone()).collect();
+
+    // Create a custom struct value using the sol! macro format
+    // DynSolValue doesn't have a native CustomStruct variant, so we encode as a named tuple
+    Some(DynSolValue::CustomStruct {
+        name: struct_name.to_string(),
+        prop_names,
+        tuple: values,
+    })
+}
+
+/// Try to read a state variable value from storage layout.
+///
+/// This function looks up a variable by name in the storage layout, reads the
+/// raw slot value, and decodes it to a DynSolValue based on its type.
+///
+/// # Supported Types
+/// - Elementary types: address, uint*, int*, bool, bytes*
+/// - Struct types: Reads all fields recursively using storage layout
+/// - For mappings and dynamic arrays, returns None to trigger fallback
+fn read_variable_from_storage_layout<DB>(
+    name: &str,
+    storage_layout: &StorageLayout,
+    target_address: Address,
+    snapshot: &Snapshot<DB>,
+) -> Option<DynSolValue>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    // Find the variable in storage layout
+    let storage_entry = storage_layout.storage.iter().find(|s| s.label == name)?;
+
+    // Parse slot number
+    let slot: U256 = storage_entry.slot.parse().ok()?;
+
+    // Get the type info
+    let type_info = storage_layout.types.get(&storage_entry.storage_type)?;
+
+    // For now, only handle elementary types (not mappings, arrays, or structs)
+    // Complex types will be handled by the ABI-based fallback
+    if type_info.encoding != "inplace" {
+        return None;
+    }
+
+    // Check if it's a complex type by looking at the type name
+    let type_label = &type_info.label;
+    if type_label.starts_with("mapping(") || type_label.ends_with("[]") {
+        return None;
+    }
+
+    // Handle struct types by reading all fields from storage
+    if type_label.starts_with("struct ") {
+        return read_struct_from_storage_layout(
+            &storage_entry.storage_type,
+            slot,
+            storage_layout,
+            target_address,
+            snapshot,
+        );
+    }
+
+    // Read the storage slot
+    let db = snapshot.db();
+    let raw_value = db
+        .cache
+        .accounts
+        .get(&target_address)?
+        .storage
+        .get(&slot)
+        .cloned()
+        .unwrap_or_default();
+
+    // Decode based on type
+    let offset = storage_entry.offset as usize;
+    let n_bytes: usize = type_info.number_of_bytes.parse().ok()?;
+
+    decode_storage_value(type_label, raw_value, offset, n_bytes)
+}
+
+/// Decode a raw storage value to a DynSolValue based on its type.
+fn decode_storage_value(
+    type_label: &str,
+    raw_value: U256,
+    offset: usize,
+    n_bytes: usize,
+) -> Option<DynSolValue> {
+    // Convert U256 to bytes for extraction
+    let mut bytes = [0u8; 32];
+    raw_value.to_be_bytes::<32>().clone_into(&mut bytes);
+
+    // Storage values are right-aligned in the slot, but for packed values
+    // we need to extract from the right offset
+    // Solidity stores from right to left in packed slots
+    let start = 32 - offset - n_bytes;
+    let extracted = &bytes[start..start + n_bytes];
+
+    match type_label {
+        "address" => {
+            if n_bytes >= 20 {
+                let addr_bytes: [u8; 20] = extracted[extracted.len() - 20..]
+                    .try_into()
+                    .ok()?;
+                Some(DynSolValue::Address(Address::from(addr_bytes)))
+            } else {
+                None
+            }
+        }
+        "bool" => {
+            let val = extracted.last().copied().unwrap_or(0);
+            Some(DynSolValue::Bool(val != 0))
+        }
+        t if t.starts_with("uint") => {
+            // Reconstruct U256 from extracted bytes
+            let mut padded = [0u8; 32];
+            padded[32 - n_bytes..].copy_from_slice(extracted);
+            let val = U256::from_be_bytes::<32>(padded);
+            let bits = n_bytes * 8;
+            Some(DynSolValue::Uint(val, bits))
+        }
+        t if t.starts_with("int") => {
+            // Handle signed integers
+            let mut padded = [0u8; 32];
+            // Sign extend if negative
+            let sign_bit = extracted.first().copied().unwrap_or(0) & 0x80;
+            if sign_bit != 0 {
+                padded.fill(0xFF);
+            }
+            padded[32 - n_bytes..].copy_from_slice(extracted);
+            let val = alloy_primitives::I256::from_be_bytes::<32>(padded);
+            let bits = n_bytes * 8;
+            Some(DynSolValue::Int(val, bits))
+        }
+        t if t.starts_with("bytes") && !t.ends_with("[]") => {
+            // Fixed-size bytes (bytes1..bytes32)
+            if n_bytes <= 32 {
+                // For fixed bytes, the value is left-aligned in the slot
+                // and stored in the most significant bytes
+                let mut fixed = [0u8; 32];
+                fixed[..n_bytes].copy_from_slice(extracted);
+                Some(DynSolValue::FixedBytes(
+                    alloy_primitives::FixedBytes::from_slice(&fixed[..n_bytes]),
+                    n_bytes,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Unsupported type, return None to trigger fallback
+            debug!("Unsupported storage type for direct decoding: {}", type_label);
+            None
+        }
+    }
 }
 
 /// EDB-specific handler that uses EdbContext to resolve values
@@ -247,8 +485,35 @@ where
             return Ok(DynSolValue::Address(snapshot.target_address()));
         }
 
-        let SnapshotDetail::Hook(detail) = &snapshot.detail() else {
-            bail!("Cannot get variable value from opcode snapshot (except this)");
+        let bytecode_address = snapshot.bytecode_address();
+        let target_address = snapshot.target_address();
+
+        // For opcode snapshots, try storage layout for primitive state variables
+        if let SnapshotDetail::Opcode(_) = snapshot.detail() {
+            // Try to read primitive state variables from storage layout
+            if let Some(artifact) = self.0.context.recompiled_artifacts.get(&bytecode_address) {
+                if let Some(storage_layout) = artifact.storage_layout() {
+                    if let Some(value) = read_variable_from_storage_layout(
+                        name,
+                        storage_layout,
+                        target_address,
+                        snapshot,
+                    ) {
+                        debug!(
+                            "Read state variable '{}' from storage layout on opcode snapshot",
+                            name
+                        );
+                        return Ok(value);
+                    }
+                }
+            }
+            // For complex types and local variables, opcode snapshots can't help
+            bail!("Cannot get variable value from opcode snapshot (except this and primitive state variables)");
+        }
+
+        // Hook snapshot handling (original behavior)
+        let SnapshotDetail::Hook(detail) = snapshot.detail() else {
+            unreachable!("Already handled opcode case above");
         };
 
         // Let's first check whether this could be a local or state variable
@@ -259,7 +524,6 @@ where
         }
 
         // Next, it might be a mapping/array variable
-        let bytecode_address = snapshot.bytecode_address();
         let Some(contract) = self
             .0
             .context

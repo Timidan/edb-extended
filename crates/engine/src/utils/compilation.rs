@@ -224,6 +224,7 @@ mod tests {
         let etherscan_cache_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/cache/etherscan")
             .join(chain_id.to_string());
+        // Use chain-native Etherscan-compatible API (V2 requires Pro-tier for multi-chain)
         let etherscan = Client::builder()
             .with_api_key(next_etherscan_api_key())
             .with_cache(Some(etherscan_cache_root), Duration::from_secs(24 * 60 * 60)) // 24 hours

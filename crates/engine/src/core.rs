@@ -51,15 +51,15 @@ use dashmap::DashMap;
 use edb_common::ForkResult;
 use eyre::Result;
 use revm::{context::Host, database::CacheDB, Database, DatabaseCommit, DatabaseRef};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, panic, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     orchestration,
     rpc::{start_debug_server, RpcServerHandle},
     utils::next_etherscan_api_key,
-    EngineContext, SnapshotAnalysis,
+    EngineContext, FinalizeOptions, SnapshotAnalysis,
 };
 
 /// Configuration for the EDB debugging engine.
@@ -74,6 +74,8 @@ pub struct EngineConfig {
     pub etherscan_api_key: Option<String>,
     /// Quick mode flag - when enabled, skips time-intensive operations for faster analysis
     pub quick: bool,
+    /// Precompute state variables for hook snapshots during context finalization
+    pub precompute_state_variables: bool,
 }
 
 impl Default for EngineConfig {
@@ -82,6 +84,7 @@ impl Default for EngineConfig {
             rpc_proxy_url: "http://localhost:8545".into(),
             etherscan_api_key: None,
             quick: false,
+            precompute_state_variables: true,
         }
     }
 }
@@ -96,6 +99,12 @@ impl EngineConfig {
     /// Enable or disable quick mode for faster analysis
     pub fn with_quick_mode(mut self, quick: bool) -> Self {
         self.quick = quick;
+        self
+    }
+
+    /// Enable or disable state variable precomputation during context finalization
+    pub fn with_precompute_state_variables(mut self, precompute_state_variables: bool) -> Self {
+        self.precompute_state_variables = precompute_state_variables;
         self
     }
 
@@ -168,7 +177,7 @@ impl Engine {
     /// This method accepts a forked database and EVM configuration prepared by the edb binary.
     /// It focuses on the core debugging workflow:
     /// 1. Replays the target transaction to collect touched contracts
-    /// 2. Downloads verified source code for each contract
+    /// 2. Downloads verified source code for each contract (skipping pre-loaded ones)
     /// 3. Analyzes the source code to identify instrumentation points
     /// 4. Instruments and recompiles the source code
     /// 5. Collect opcode-level step execution results
@@ -181,10 +190,18 @@ impl Engine {
     /// Per-transaction locking ensures that only one thread can analyze a given transaction
     /// at a time. If a transaction is already being analyzed by another thread, subsequent
     /// calls will wait for the analysis to complete and then return the cached result.
+    ///
+    /// # Pre-loaded Artifacts
+    ///
+    /// If `preloaded_artifacts` is provided, those artifacts will be used directly and
+    /// skipped during the download phase. This allows the frontend to pass Sourcify artifacts
+    /// it has already fetched, avoiding duplicate network requests and significantly
+    /// improving simulation performance.
     pub async fn prepare<DB>(
         &self,
         fork_result: ForkResult<DB>,
         progress_tx: Option<mpsc::UnboundedSender<edb_common::ProgressMessage>>,
+        preloaded_artifacts: Option<std::collections::HashMap<alloy_primitives::Address, crate::Artifact>>,
     ) -> Result<SocketAddr>
     where
         DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
@@ -232,6 +249,7 @@ impl Engine {
         }
 
         info!("Starting engine preparation for transaction: {:?}", tx_hash);
+        let engine_start = Instant::now();
 
         // Step 0: Initialize context and database
         let ForkResult { context: mut ctx, target_tx_env: tx, target_tx_hash: tx_hash, fork_info } =
@@ -243,37 +261,68 @@ impl Engine {
             8,
             "Replaying the target transaction to collect call trace and touched contracts..."
         );
+        let step_start = Instant::now();
         let replay_result = orchestration::replay_and_collect_trace(ctx.clone(), tx.clone())?;
+        info!("[TIMING] Step 1 - replay_and_collect_trace: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 2: Download verified source code for each contract
+        // (skipping addresses that have pre-loaded artifacts from frontend)
         send_progress!(2, 8, "Downloading verified source code for each contract...");
+        let step_start = Instant::now();
         let artifacts = orchestration::download_verified_source_code(
             &self.config,
             &replay_result,
             ctx.chain_id().to::<u64>(),
+            preloaded_artifacts,
         )
         .await?;
+        info!("[TIMING] Step 2 - download_verified_source_code: {:.2}s ({} contracts)", step_start.elapsed().as_secs_f64(), artifacts.len());
+
+        // Log degradation warning if no artifacts found - we'll still get opcode-level traces
+        let touched_contracts = replay_result.visited_addresses.len();
+        if artifacts.is_empty() && touched_contracts > 0 {
+            warn!(
+                "No verified source code found for any of the {} touched contracts. \
+                 Debugging will use opcode-level traces only (no source-level debugging available).",
+                touched_contracts
+            );
+        } else if !artifacts.is_empty() && artifacts.len() < touched_contracts {
+            info!(
+                "Source code found for {}/{} touched contracts. \
+                 Contracts without source will use opcode-level traces.",
+                artifacts.len(),
+                touched_contracts
+            );
+        }
 
         // Step 3: Analyze source code to identify instrumentation points
         send_progress!(3, 8, "Analyzing source code to identify instrumentation points...");
+        let step_start = Instant::now();
         let analysis_results = orchestration::analyze_source_code(&artifacts)?;
+        info!("[TIMING] Step 3 - analyze_source_code: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 4: Instrument source code
         send_progress!(4, 8, "Instrumenting source code...");
+        let step_start = Instant::now();
         let recompiled_artifacts =
             orchestration::instrument_and_recompile_source_code(&artifacts, &analysis_results)?;
+        info!("[TIMING] Step 4 - instrument_and_recompile: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 5: Collect opcode-level step execution results
         send_progress!(5, 8, "Collecting opcode-level step execution results...");
+        let step_start = Instant::now();
+        // Collect opcode snapshots for all touched contracts (do not exclude verified ones)
         let opcode_snapshots = orchestration::capture_opcode_level_snapshots(
             ctx.clone(),
             tx.clone(),
-            artifacts.keys().cloned().collect(),
+            HashSet::new(),
             &replay_result.execution_trace,
         )?;
+        info!("[TIMING] Step 5 - capture_opcode_level_snapshots: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 6: Replace original bytecode with instrumented versions
         send_progress!(6, 8, "Replacing original bytecode with instrumented versions...");
+        let step_start = Instant::now();
         let contracts_in_tx = orchestration::tweak_bytecode(
             &self.config,
             &mut ctx,
@@ -282,30 +331,73 @@ impl Engine {
             tx_hash,
         )
         .await?;
+        info!("[TIMING] Step 6 - tweak_bytecode: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 7: Re-execute the transaction with snapshot collection
         send_progress!(7, 8, "Collecting creation hooks for contracts in transaction...");
+        let step_start = Instant::now();
         let hook_creation = orchestration::collect_creation_hooks(
             &artifacts,
             &recompiled_artifacts,
             contracts_in_tx,
         )?;
-        let hook_snapshots = orchestration::capture_hook_snapshots(
-            ctx.clone(),
-            tx.clone(),
-            hook_creation,
-            &replay_result.execution_trace,
-            &analysis_results,
-        )?;
+        // Use catch_unwind to gracefully handle panics during hook snapshot collection
+        // (Diamond contracts with many facets can trigger panics in REVM)
+        let hook_snapshots = {
+            let ctx_clone = ctx.clone();
+            let tx_clone = tx.clone();
+            let trace_ref = &replay_result.execution_trace;
+            let analysis_ref = &analysis_results;
+
+            match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                orchestration::capture_hook_snapshots(
+                    ctx_clone,
+                    tx_clone,
+                    hook_creation,
+                    trace_ref,
+                    analysis_ref,
+                )
+            })) {
+                Ok(Ok(snapshots)) => snapshots,
+                Ok(Err(e)) => {
+                    warn!("Hook snapshot collection failed: {e:?}. Using opcode-level snapshots only.");
+                    crate::HookSnapshots::default()
+                }
+                Err(panic_info) => {
+                    warn!(
+                        "Hook snapshot collection panicked: {:?}. Using opcode-level snapshots only.",
+                        panic_info.downcast_ref::<&str>().unwrap_or(&"unknown panic")
+                    );
+                    crate::HookSnapshots::default()
+                }
+            }
+        };
+        info!("[TIMING] Step 7 - capture_hook_snapshots: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 8: Start RPC server with analysis results and snapshots
         send_progress!(8, 8, "Collecting opcode-level and hook-level snapshots...");
+        let step_start = Instant::now();
         let mut snapshots =
             orchestration::get_time_travel_snapshots(opcode_snapshots, hook_snapshots)?;
-        snapshots.analyze(&replay_result.execution_trace, &analysis_results)?;
+        // Best-effort analysis; skip failures when mixing hook/opcode snapshots.
+        // Note: Even if this fails, opcode-level snapshots are still usable for basic debugging.
+        if let Err(e) = snapshots.analyze(&replay_result.execution_trace, &analysis_results) {
+            warn!(
+                "Snapshot analysis skipped (source-level variable tracking unavailable): {e:?}. \
+                 Opcode-level trace data is still available for debugging."
+            );
+        }
+        info!("[TIMING] Step 8 - get_time_travel_snapshots + analyze: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Let's pack the debug context
-        let context = EngineContext::build(
+        let step_start = Instant::now();
+        let finalize_options = FinalizeOptions {
+            precompute_state_variables: self.config.precompute_state_variables,
+        };
+        if !finalize_options.precompute_state_variables {
+            info!("[PERF] Skipping hook snapshot state-variable precompute");
+        }
+        let context = EngineContext::build_with_options(
             fork_info,
             ctx.cfg.clone(),
             ctx.block.clone(),
@@ -316,9 +408,12 @@ impl Engine {
             recompiled_artifacts,
             analysis_results,
             replay_result.execution_trace,
+            finalize_options,
         )?;
 
         let rpc_handle = start_debug_server(context).await?;
+        info!("[TIMING] Step 9 - build_context + start_debug_server: {:.2}s", step_start.elapsed().as_secs_f64());
+        info!("[TIMING] TOTAL engine.prepare(): {:.2}s", engine_start.elapsed().as_secs_f64());
         info!("Debug RPC server started on {}", rpc_handle.addr());
 
         // Store the server handle for future reference

@@ -31,7 +31,7 @@ use revm::{
     database::CacheDB,
     Database, DatabaseCommit, DatabaseRef, InspectEvm, MainBuilder,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     analysis::{analyze, AnalysisResult},
@@ -50,17 +50,30 @@ where
     let mut tracer = CallTracer::new();
     let mut evm = ctx.build_mainnet_with_inspector(&mut tracer);
 
-    let result = evm
+    let exec_result = evm
         .inspect_one_tx(tx)
         .map_err(|e| eyre::eyre!("Failed to inspect the target transaction: {:?}", e))?;
 
-    if let ExecutionResult::Halt { reason, .. } = result {
+    // Extract gas_used from ExecutionResult - this includes gas refunds
+    let gas_used = match &exec_result {
+        ExecutionResult::Success { gas_used, .. } => Some(*gas_used),
+        ExecutionResult::Revert { gas_used, .. } => Some(*gas_used),
+        ExecutionResult::Halt { gas_used, .. } => Some(*gas_used),
+    };
+
+    if let ExecutionResult::Halt { reason, .. } = exec_result {
         if matches!(reason, HaltReason::OutOfGas { .. }) {
             error!("EDB cannot debug out-of-gas errors. Proceed at your own risk.")
         }
     }
 
-    let result = tracer.into_replay_result();
+    let mut result = tracer.into_replay_result();
+
+    // Set the total gas used on the trace (includes gas refunds from SSTORE, etc.)
+    if let Some(gas) = gas_used {
+        result.execution_trace.set_total_gas_used(gas);
+        debug!("Transaction gas used (with refunds): {}", gas);
+    }
 
     for (address, deployed) in &result.visited_addresses {
         if *deployed {
@@ -70,8 +83,8 @@ where
         }
     }
 
-    // Print the trace tree structure
-    result.execution_trace.print_trace_tree();
+    // Print the trace tree structure (disabled for simulator - causes stdout pollution)
+    // result.execution_trace.print_trace_tree();
 
     Ok(result)
 }
@@ -85,9 +98,20 @@ pub fn analyze_source_code(
     let mut analysis_result = HashMap::new();
     for (address, artifact) in artifacts {
         debug!("Analyzing contract at address: {address}");
-        let analysis = analyze(artifact)?;
-        debug!("Finished analyzing contract at address: {address}");
-        analysis_result.insert(*address, analysis);
+        match analyze(artifact) {
+            Ok(analysis) => {
+                debug!("Finished analyzing contract at address: {address}");
+                analysis_result.insert(*address, analysis);
+            }
+            Err(e) => {
+                // Log the error but continue with other contracts
+                // Contracts that fail AST analysis will use opcode-level traces instead
+                warn!(
+                    "Failed to analyze contract at address {address}: {e}. \
+                     This contract will use opcode-level traces instead of source-level debugging."
+                );
+            }
+        }
     }
 
     Ok(analysis_result)
@@ -114,21 +138,43 @@ where
     let mut contracts_in_tx = Vec::new();
 
     for (address, recompiled_artifact) in recompiled_artifacts {
-        let creation_tx_hash = tweaker.get_creation_tx(address).await?;
+        let creation_tx_hash = match tweaker.get_creation_tx(address).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                warn!(
+                    "Failed to get creation tx for contract {address}: {e}. \
+                     This contract will use opcode-level traces instead of source-level debugging."
+                );
+                continue;
+            }
+        };
         if creation_tx_hash == tx_hash {
             debug!("Skip tweaking contract {}, since it was created by the transaction under investigation", address);
             contracts_in_tx.push(*address);
             continue;
         }
 
-        let artifact = artifacts
-            .get(address)
-            .ok_or_else(|| eyre::eyre!("No original artifact found for address {}", address))?;
+        let artifact = match artifacts.get(address) {
+            Some(a) => a,
+            None => {
+                warn!(
+                    "No original artifact found for address {address}. \
+                     This contract will use opcode-level traces instead of source-level debugging."
+                );
+                continue;
+            }
+        };
 
-        tweaker
+        if let Err(e) = tweaker
             .tweak(address, artifact, recompiled_artifact, config.quick)
             .await
-            .map_err(|e| eyre::eyre!("Failed to tweak bytecode for contract {}: {}", address, e))?;
+        {
+            warn!(
+                "Failed to tweak bytecode for contract {address}: {e}. \
+                 This contract will use opcode-level traces instead of source-level debugging."
+            );
+            // Continue with other contracts instead of failing the entire operation
+        }
     }
 
     Ok(contracts_in_tx)

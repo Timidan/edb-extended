@@ -82,6 +82,8 @@ where
     /// Transient storage
     #[serde(with = "edb_common::types::arc_transient_string_map")]
     pub transient_storage: Arc<TransientStorage>,
+    /// Gas remaining before executing this opcode
+    pub gas_remaining: u64,
 }
 
 /// Collection of opcode snapshots
@@ -406,6 +408,7 @@ where
             calldata,
             database: self.database.clone(),
             transient_storage: self.transient_storage.clone(),
+            gas_remaining: interp.gas.remaining(),
         };
 
         // Add to snapshots for this frame

@@ -197,10 +197,9 @@ pub fn dyn_sol_type(
                     let mut prop_types = Vec::with_capacity(definition.members.len());
                     for field in definition.members.iter() {
                         prop_names.push(field.name.clone());
-                        prop_types.push(
-                            dyn_sol_type(all_user_defined_types, field.type_name.as_ref()?)
-                                .unwrap(),
-                        );
+                        // Handle None gracefully instead of panicking
+                        let sol_type = dyn_sol_type(all_user_defined_types, field.type_name.as_ref()?)?;
+                        prop_types.push(sol_type);
                     }
                     Some(DynSolType::CustomStruct {
                         name: definition.name.clone(),

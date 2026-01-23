@@ -25,7 +25,7 @@ use revm::{database::CacheDB, Database, DatabaseCommit, DatabaseRef};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::{error_codes, utils::disasm::disassemble, EngineContext, SnapshotDetail};
+use crate::{error_codes, utils::disasm::disassemble, utils::Artifact, EngineContext, SnapshotDetail};
 
 use super::super::types::RpcError;
 
@@ -188,6 +188,43 @@ where
     Ok(json_value)
 }
 
+/// Get full artifact (metadata + sources + source maps) for a contract address
+pub fn get_artifact_by_address<DB>(
+    context: &Arc<EngineContext<DB>>,
+    params: Option<Value>,
+) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let address: Address = params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Invalid params: expected [address]".to_string(),
+            data: None,
+        })?;
+
+    let artifact: &Artifact = context.artifacts.get(&address).ok_or_else(|| RpcError {
+        code: error_codes::INVALID_ADDRESS,
+        message: format!("No artifact found for address {address}"),
+        data: None,
+    })?;
+
+    let json_value = serde_json::to_value(artifact).map_err(|e| RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: format!("Failed to serialize artifact: {e}"),
+        data: None,
+    })?;
+
+    debug!("Retrieved artifact for address {}", address);
+    Ok(json_value)
+}
+
 /// Get constructor arguments for a contract at a specific address
 ///
 /// This method retrieves the constructor arguments used during the deployment
@@ -229,6 +266,102 @@ where
     })?;
 
     debug!("Retrieved contract ABI for address {}", address);
+    Ok(json_value)
+}
+
+/// Get storage layout for a contract at a specific address
+///
+/// This method retrieves the storage layout information for a contract,
+/// which includes slot positions, byte offsets, and type definitions for
+/// all state variables including struct fields.
+///
+/// # Parameters
+/// - `address`: The contract address
+///
+/// # Returns
+/// - The storage layout JSON object with:
+///   - `storage`: Array of storage entries (slot, offset, label, type)
+///   - `types`: Map of type definitions with encoding, size, and members
+///
+/// # Example Response
+/// ```json
+/// {
+///   "storage": [
+///     { "astId": 123, "label": "_owner", "offset": 0, "slot": "0", "type": "t_address" },
+///     { "astId": 456, "label": "myStruct", "offset": 0, "slot": "1", "type": "t_struct_MyStruct" }
+///   ],
+///   "types": {
+///     "t_address": { "encoding": "inplace", "label": "address", "numberOfBytes": "20" },
+///     "t_struct_MyStruct": {
+///       "encoding": "inplace",
+///       "label": "struct MyStruct",
+///       "numberOfBytes": "64",
+///       "members": [
+///         { "label": "field1", "offset": 0, "slot": "0", "type": "t_uint256" }
+///       ]
+///     }
+///   }
+/// }
+/// ```
+pub fn get_storage_layout<DB>(
+    context: &Arc<EngineContext<DB>>,
+    params: Option<Value>,
+) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    // Parse the address as the first argument
+    let address: Address = params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Invalid params: expected [address]".to_string(),
+            data: None,
+        })?;
+
+    // Optional: contract name for multi-contract artifacts
+    let contract_name: Option<String> = params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.get(1))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let artifact = context.artifacts.get(&address).ok_or_else(|| RpcError {
+        code: error_codes::INVALID_ADDRESS,
+        message: format!("No artifact found for address {address}"),
+        data: None,
+    })?;
+
+    let storage_layout = match &contract_name {
+        Some(name) => artifact.storage_layout_for(name),
+        None => artifact.storage_layout(),
+    }
+    .ok_or_else(|| RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: format!(
+            "No storage layout found for contract {}",
+            contract_name.as_deref().unwrap_or(artifact.contract_name())
+        ),
+        data: None,
+    })?;
+
+    let json_value = serde_json::to_value(storage_layout).map_err(|e| RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: format!("Failed to serialize storage layout: {e}"),
+        data: None,
+    })?;
+
+    debug!(
+        "Retrieved storage layout for address {} (contract: {})",
+        address,
+        contract_name.as_deref().unwrap_or(artifact.contract_name())
+    );
     Ok(json_value)
 }
 

@@ -37,7 +37,7 @@
 
 use alloy_primitives::Bytes;
 use foundry_block_explorers::contract::Metadata;
-use foundry_compilers::artifacts::{CompilerOutput, Contract, SolcInput};
+use foundry_compilers::artifacts::{CompilerOutput, Contract, SolcInput, StorageLayout};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -83,6 +83,27 @@ impl Artifact {
             .into_iter()
             .find(|c| c.contains_key(contract_name))
             .and_then(|contracts| contracts.get(contract_name))
+    }
+
+    /// Returns the storage layout for the main contract.
+    ///
+    /// The storage layout provides detailed information about how state variables
+    /// are stored, including slot positions, byte offsets, and type definitions.
+    /// This is essential for reading struct fields from storage.
+    pub fn storage_layout(&self) -> Option<&StorageLayout> {
+        self.contract().map(|c| &c.storage_layout)
+    }
+
+    /// Returns the storage layout for a specific contract by name.
+    ///
+    /// Useful when you need the storage layout of a contract that isn't the main contract.
+    pub fn storage_layout_for(&self, contract_name: &str) -> Option<&StorageLayout> {
+        self.output
+            .contracts
+            .values()
+            .find(|c| c.contains_key(contract_name))
+            .and_then(|contracts| contracts.get(contract_name))
+            .map(|c| &c.storage_layout)
     }
 
     /// Find creation hooks (one-to-one mapping)

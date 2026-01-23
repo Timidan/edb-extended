@@ -3,6 +3,7 @@ members = [
     "crates/engine/",
     "crates/tui/",
     "crates/edb/",
+    "crates/edb-simulator/",
     "crates/rpc-proxy/",
     "crates/common/",
     "crates/integration-tests/",
@@ -67,6 +68,10 @@ inherits = "local"
 debug = true
 strip = "none"
 panic = "unwind"
+
+# Override svm-rs-builds to local patched copy to deduplicate solc versions
+[patch.crates-io]
+svm-rs-builds = { path = "vendor/svm-rs-builds" }
 
 # Optimized release profile.
 [profile.release]

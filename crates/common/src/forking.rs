@@ -137,24 +137,55 @@ pub async fn fork_and_prepare(
 
     info!("Target transaction is in block {}", target_block_number);
 
-    // Get the full block with transactions
-    let block = provider
+    // Get the full block with transactions - with fallback for L2 chains
+    let (block, full_tx_available) = match provider
         .get_block_by_number(BlockNumberOrTag::Number(target_block_number))
         .full()
-        .await?
-        .ok_or_else(|| eyre::eyre!("Block {} not found", target_block_number))?;
+        .await
+    {
+        Ok(Some(block)) => (block, true),
+        Ok(None) => {
+            return Err(eyre::eyre!("Block {} not found", target_block_number));
+        }
+        Err(full_error) => {
+            // L2 chains may have special transaction types (e.g., type 0x7e deposits on Base/OP)
+            // that can't be deserialized. Fall back to header-only fetch.
+            warn!(
+                "Failed to fetch block with full transactions: {full_error}. \
+                 Falling back to header-only fetch (quick mode will be forced)."
+            );
+            let fallback_block = provider
+                .get_block_by_number(BlockNumberOrTag::Number(target_block_number))
+                .await
+                .map_err(|e| eyre::eyre!("Failed to fetch block (fallback): {e}"))?
+                .ok_or_else(|| eyre::eyre!("Block {} not found (fallback)", target_block_number))?;
+            (fallback_block, false)
+        }
+    };
 
-    // Get the transactions in the block
+    // Get the transactions in the block (may be empty if full_tx_available is false)
     let transactions = block.transactions.as_transactions().unwrap_or_default();
 
-    // Find target transaction index
-    let target_index = transactions
-        .iter()
-        .position(|tx| *tx.inner.hash() == target_tx_hash)
-        .ok_or_else(|| eyre::eyre!("Target transaction not found in block"))?;
+    // If we couldn't get full transactions, force quick mode
+    let quick = if !full_tx_available && !quick {
+        warn!("Forcing quick mode because full transactions are not available");
+        true
+    } else {
+        quick
+    };
 
-    // Get all transactions before the target
-    let preceding_txs: Vec<&Transaction> = transactions.iter().take(target_index).collect();
+    // Find target transaction index and get preceding transactions
+    // If full_tx_available is false, we skip this (no preceding txs to replay in quick mode)
+    let preceding_txs: Vec<&Transaction> = if full_tx_available {
+        let target_index = transactions
+            .iter()
+            .position(|tx| *tx.inner.hash() == target_tx_hash)
+            .ok_or_else(|| eyre::eyre!("Target transaction not found in block"))?;
+        transactions.iter().take(target_index).collect()
+    } else {
+        // In fallback mode, we can't determine preceding transactions
+        Vec::new()
+    };
 
     // Get the spec ID for the block using our mainnet mapping
     let spec_id = get_mainnet_spec_id(target_block_number);
@@ -198,10 +229,18 @@ pub async fn fork_and_prepare(
             b.difficulty = block.header.difficulty;
             b.gas_limit = block.header.gas_limit;
             b.prevrandao = Some(block.header.mix_hash);
-            // Note: blob_excess_gas_and_price might not be available in older blocks
-            b.blob_excess_gas_and_price = block.header.excess_blob_gas.map(|g| {
-                BlobExcessGasAndPrice::new(g, get_blob_base_fee_update_fraction_by_spec_id(spec_id))
-            });
+            // REVM requires blob_excess_gas_and_price for Cancun+ specs
+            // Default to 0 if RPC doesn't return excess_blob_gas (some providers omit it)
+            b.blob_excess_gas_and_price = if spec_id >= SpecId::CANCUN {
+                Some(BlobExcessGasAndPrice::new(
+                    block.header.excess_blob_gas.unwrap_or(0),
+                    get_blob_base_fee_update_fraction_by_spec_id(spec_id),
+                ))
+            } else {
+                block.header.excess_blob_gas.map(|g| {
+                    BlobExcessGasAndPrice::new(g, get_blob_base_fee_update_fraction_by_spec_id(spec_id))
+                })
+            };
             b.beneficiary = block.header.beneficiary;
         })
         .modify_cfg_chained(|c| {

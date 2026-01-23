@@ -270,10 +270,10 @@ where
             |step: &StepRef| step.function_entry().is_some() || step.modifier_entry().is_some();
 
         for i in 0..snapshots.len().saturating_sub(1) {
-            let usid = snapshots[i]
-                .1
-                .usid()
-                .ok_or_else(|| eyre::eyre!("Snapshot {} does not have usid set", i))?;
+            let Some(usid) = snapshots[i].1.usid() else {
+                // Skip snapshots (e.g., opcode-only) that do not carry a USID
+                continue;
+            };
             let step = analysis
                 .usid_to_step
                 .get(&usid)
@@ -282,10 +282,10 @@ where
             let contract = analysis.ufid_to_function.get(&ufid).and_then(|f| f.contract());
 
             let next_id = snapshots[i + 1].1.id();
-            let next_usid = snapshots[i + 1]
-                .1
-                .usid()
-                .ok_or_else(|| eyre::eyre!("Snapshot {} does not have usid set", i + 1))?;
+            let Some(next_usid) = snapshots[i + 1].1.usid() else {
+                // Skip transitions into opcode-only snapshots without USID
+                continue;
+            };
             let next_step = analysis
                 .usid_to_step
                 .get(&next_usid)

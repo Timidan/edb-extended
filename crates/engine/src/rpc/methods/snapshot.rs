@@ -33,8 +33,10 @@
 
 use std::sync::Arc;
 
+use alloy_primitives::U256;
 use edb_common::types::{
-    HookSnapshotInfoDetail, OpcodeSnapshotInfoDetail, SnapshotInfo, SnapshotInfoDetail,
+    HookSnapshotInfoDetail, LightweightOpcodeEntry, OpcodeSnapshotInfoDetail, SnapshotInfo,
+    SnapshotInfoDetail, StorageAccess, StorageWrite,
 };
 use revm::{database::CacheDB, Database, DatabaseCommit, DatabaseRef};
 use serde_json::Value;
@@ -92,6 +94,35 @@ where
 
     let snapshot_info = match snapshot.detail() {
         SnapshotDetail::Opcode(ref opcode_snapshot) => {
+            let target_address = snapshot.target_address();
+            // Compute storage access info for SLOAD/SSTORE
+            let mut storage_read: Option<StorageAccess> = None;
+            let mut storage_write: Option<StorageWrite> = None;
+            let stack = &opcode_snapshot.stack;
+            match opcode_snapshot.opcode {
+                // SLOAD
+                0x54 => {
+                    if let Some(slot) = stack.peek(0) {
+                        if let Ok(value) = opcode_snapshot.database.storage_ref(target_address, *slot) {
+                            storage_read = Some(StorageAccess { slot: *slot, value });
+                        }
+                    }
+                }
+                // SSTORE
+                0x55 => {
+                    let slot_opt = stack.peek(1);
+                    let value_opt = stack.peek(0);
+                    if let (Some(slot), Some(after)) = (slot_opt, value_opt) {
+                        let before = opcode_snapshot
+                            .database
+                            .storage_ref(target_address, *slot)
+                            .unwrap_or(U256::ZERO);
+                        storage_write = Some(StorageWrite { slot: *slot, before, after: *after });
+                    }
+                }
+                _ => {}
+            }
+
             // For opcode snapshots, return complete execution state
             SnapshotInfo {
                 id: snapshot.id(),
@@ -117,6 +148,9 @@ where
                     stack: opcode_snapshot.stack.to_vec(),
                     calldata: opcode_snapshot.calldata.as_ref().clone(),
                     transient_storage: opcode_snapshot.transient_storage.as_ref().clone(),
+                    gas_remaining: opcode_snapshot.gas_remaining,
+                    storage_read,
+                    storage_write,
                 }),
             }
         }
@@ -222,6 +256,104 @@ where
     serde_json::to_value(total_snapshots).map_err(|e| RpcError {
         code: error_codes::INTERNAL_ERROR,
         message: format!("Failed to serialize total snapshots: {e}"),
+        data: None,
+    })
+}
+
+/// Get a lightweight opcode trace for UI display.
+///
+/// This method returns a compact representation of opcode-level snapshots
+/// suitable for displaying in the trace view. Unlike `edb_getSnapshotInfo`,
+/// this does NOT include the full database state, memory, or complete stack -
+/// only the essential information needed for the trace display.
+///
+/// # Parameters
+/// None - returns all opcode entries
+///
+/// # Returns
+/// An array of lightweight opcode entries with pc, opcode, gas, storage access, etc.
+pub fn get_opcode_trace<DB>(context: &Arc<EngineContext<DB>>) -> Result<Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let mut entries: Vec<LightweightOpcodeEntry> = Vec::new();
+    let total = context.snapshots.len();
+
+    for i in 0..total {
+        let Some((frame_id, snapshot)) = context.snapshots.get(i) else {
+            continue;
+        };
+
+        // Only include opcode snapshots, not hook snapshots
+        let SnapshotDetail::Opcode(ref opcode_snapshot) = snapshot.detail() else {
+            continue;
+        };
+
+        let target_address = snapshot.target_address();
+        let stack = &opcode_snapshot.stack;
+
+        // Compute storage access info for SLOAD/SSTORE
+        let mut storage_read: Option<StorageAccess> = None;
+        let mut storage_write: Option<StorageWrite> = None;
+
+        match opcode_snapshot.opcode {
+            // SLOAD
+            0x54 => {
+                if let Some(slot) = stack.peek(0) {
+                    if let Ok(value) = opcode_snapshot.database.storage_ref(target_address, *slot) {
+                        storage_read = Some(StorageAccess { slot: *slot, value });
+                    }
+                }
+            }
+            // SSTORE
+            0x55 => {
+                let slot_opt = stack.peek(1);
+                let value_opt = stack.peek(0);
+                if let (Some(slot), Some(after)) = (slot_opt, value_opt) {
+                    let before = opcode_snapshot
+                        .database
+                        .storage_ref(target_address, *slot)
+                        .unwrap_or(U256::ZERO);
+                    storage_write = Some(StorageWrite { slot: *slot, before, after: *after });
+                }
+            }
+            _ => {}
+        }
+
+        // Compute gas_used from next snapshot if available
+        let gas_used = snapshot.next_id().and_then(|next_id| {
+            context.snapshots.get(next_id).and_then(|(_, next_snap)| {
+                if let SnapshotDetail::Opcode(ref next_opcode) = next_snap.detail() {
+                    Some(opcode_snapshot.gas_remaining.saturating_sub(next_opcode.gas_remaining))
+                } else {
+                    None
+                }
+            })
+        });
+
+        entries.push(LightweightOpcodeEntry {
+            id: snapshot.id(),
+            frame_id: *frame_id,
+            pc: opcode_snapshot.pc,
+            opcode: opcode_snapshot.opcode,
+            gas_remaining: opcode_snapshot.gas_remaining,
+            gas_used,
+            target_address,
+            bytecode_address: snapshot.bytecode_address(),
+            storage_read,
+            storage_write,
+            stack_top: stack.peek(0).copied(),
+            stack_depth: stack.len(),
+        });
+    }
+
+    debug!("Generated lightweight opcode trace with {} entries", entries.len());
+
+    serde_json::to_value(&entries).map_err(|e| RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: format!("Failed to serialize opcode trace: {e}"),
         data: None,
     })
 }

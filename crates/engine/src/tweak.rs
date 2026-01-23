@@ -51,7 +51,7 @@
 //! This replaces the deployed bytecode at `contract_address` with the instrumented version,
 //! enabling advanced debugging features on the modified contract.
 
-use std::env;
+use std::{env, time::Instant};
 
 use alloy_primitives::{Address, Bytes, TxHash};
 use edb_common::{
@@ -67,9 +67,30 @@ use revm::{
     state::Bytecode,
     Database, DatabaseCommit, DatabaseRef, InspectEvm, MainBuilder,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::{next_etherscan_api_key, Artifact, TweakInspector};
+
+/// Returns the correct Etherscan API URL for a chain.
+///
+/// Many chains (Base, Fraxtal, Mode, etc.) have deprecated their chain-native V1 APIs
+/// and now require using the Etherscan V2 unified API (api.etherscan.io/v2/api).
+/// The V2 API requires a Pro-tier API key for non-mainnet chains.
+///
+/// This function returns the correct V2 unified API URL for chains that have migrated,
+/// or None to use the default chain mapping for chains that still support V1.
+fn get_etherscan_v2_api_url(chain_id: u64) -> Option<String> {
+    match chain_id {
+        // Base chains - migrated to Etherscan V2 unified API (chain-native API deprecated)
+        8453 | 84532 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
+        // Fraxtal chains - migrated to Etherscan V2 unified API
+        252 | 2522 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
+        // Mode chains - migrated to Etherscan V2 unified API
+        34443 | 919 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
+        // Other chains - use default mapping (chain-native APIs still work)
+        _ => None,
+    }
+}
 
 /// Utility for modifying deployed contract bytecode through creation transaction replay.
 ///
@@ -137,8 +158,11 @@ where
         recompiled_artifact: &Artifact,
         quick: bool,
     ) -> Result<()> {
+        let tweak_start = Instant::now();
         let tweaked_code =
             self.get_tweaked_code(addr, artifact, recompiled_artifact, quick).await?;
+        info!("[TIMING] Contract {} get_tweaked_code: {:.2}s", addr, tweak_start.elapsed().as_secs_f64());
+
         if tweaked_code.is_empty() {
             error!(addr=?addr, quick=?quick, "Tweaked code is empty");
         }
@@ -171,12 +195,16 @@ where
         recompiled_artifact: &Artifact,
         quick: bool,
     ) -> Result<Bytes> {
+        let creation_tx_start = Instant::now();
         let creation_tx_hash = self.get_creation_tx(addr).await?;
+        info!("[TIMING] Contract {} get_creation_tx: {:.2}s", addr, creation_tx_start.elapsed().as_secs_f64());
         debug!("Creation tx: {} -> {}", creation_tx_hash, addr);
 
         // Create replay environment
+        let fork_start = Instant::now();
         let ForkResult { context: mut replay_ctx, target_tx_env: mut creation_tx_env, .. } =
             fork_and_prepare(&self.rpc_url, creation_tx_hash, quick).await?;
+        info!("[TIMING] Contract {} fork_and_prepare (creation tx): {:.2}s", addr, fork_start.elapsed().as_secs_f64());
         relax_evm_constraints(&mut replay_ctx, &mut creation_tx_env);
 
         // Get init code
@@ -192,8 +220,10 @@ where
 
         let mut evm = replay_ctx.build_mainnet_with_inspector(&mut inspector);
 
+        let inspect_start = Instant::now();
         evm.inspect_one_tx(creation_tx_env)
             .map_err(|e| eyre::eyre!("Failed to inspect the target transaction: {:?}", e))?;
+        info!("[TIMING] Contract {} inspect_one_tx (creation replay): {:.2}s", addr, inspect_start.elapsed().as_secs_f64());
 
         inspector.into_deployed_code()
     }
@@ -228,11 +258,21 @@ where
             let etherscan_api_key =
                 self.etherscan_api_key.clone().unwrap_or(next_etherscan_api_key());
 
-            // Build client
-            let etherscan = Client::builder()
+            // Use chain-native Etherscan-compatible API (e.g., api.basescan.org for Base)
+            // instead of V2 unified API which requires Pro-tier API key for multi-chain.
+            // The alloy-chains library incorrectly maps some chains (Base, Fraxtal, etc.)
+            // to the V2 API, so we need to override those here.
+            let mut builder = Client::builder()
                 .with_api_key(etherscan_api_key)
-                .chain(chain_id.into())?
-                .build()?;
+                .chain(chain_id.into())?;
+
+            // Override API URL for chains that have migrated to Etherscan V2 unified API
+            // (chain-native APIs like api.basescan.org are deprecated and no longer work)
+            if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
+                builder = builder.with_api_url(v2_url)?;
+            }
+
+            let etherscan = builder.build()?;
 
             // Get creation tx
             let creation_data = etherscan.contract_creation_data(*addr).await?;

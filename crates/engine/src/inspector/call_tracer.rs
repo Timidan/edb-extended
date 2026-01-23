@@ -122,6 +122,7 @@ impl<CTX: ContextTr> Inspector<CTX> for CallTracer {
             input: inputs.input.bytes(context),
             value: inputs.transfer_value().unwrap_or(U256::ZERO),
             result: None,        // Will be filled in call_end
+            gas_used: None,      // Will be filled in call_end from outcome
             events: vec![],      // Will be filled in log
             self_destruct: None, // Will be filled in self_destruct
             created_contract: false,
@@ -151,6 +152,8 @@ impl<CTX: ContextTr> Inspector<CTX> for CallTracer {
         };
 
         trace_entry.result = Some(outcome.into());
+        // Capture gas used from the outcome - this is the actual gas consumed by this call
+        trace_entry.gas_used = Some(outcome.result.gas.spent());
 
         let target = inputs.target_address;
         let code_address = inputs.bytecode_address;
@@ -186,6 +189,7 @@ impl<CTX: ContextTr> Inspector<CTX> for CallTracer {
             input: inputs.init_code.clone(),
             value: inputs.value,
             result: None,            // Will be filled in create_end
+            gas_used: None,          // Will be filled in create_end from outcome
             events: vec![],          // Will be filled in log
             self_destruct: None,     // Will be filled in self_destruct
             created_contract: false, // Will be updated in create_end
@@ -226,6 +230,8 @@ impl<CTX: ContextTr> Inspector<CTX> for CallTracer {
         }
 
         trace_entry.result = Some(outcome.into());
+        // Capture gas used from the outcome - this is the actual gas consumed by this create
+        trace_entry.gas_used = Some(outcome.result.gas.spent());
 
         if matches!(trace_entry.result, Some(CallResult::Revert { .. })) {
             debug!("Creation failed");

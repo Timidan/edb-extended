@@ -33,6 +33,7 @@ fn test_default_config() {
     assert_eq!(config.rpc_proxy_url, "http://localhost:8545");
     assert_eq!(config.etherscan_api_key, None);
     assert!(!config.quick);
+    assert!(config.precompute_state_variables);
 }
 
 #[test]
@@ -43,11 +44,13 @@ fn test_config_with_custom_values() {
         rpc_proxy_url: "http://localhost:9545".to_string(),
         etherscan_api_key: Some("test_key".to_string()),
         quick: true,
+        precompute_state_variables: false,
     };
 
     assert_eq!(config.rpc_proxy_url, "http://localhost:9545");
     assert_eq!(config.etherscan_api_key, Some("test_key".to_string()));
     assert!(config.quick);
+    assert!(!config.precompute_state_variables);
 }
 
 #[test]
@@ -58,6 +61,7 @@ fn test_config_clone() {
         rpc_proxy_url: "http://localhost:8080".to_string(),
         etherscan_api_key: Some("key".to_string()),
         quick: false,
+        precompute_state_variables: true,
     };
 
     let cloned = config.clone();
@@ -65,4 +69,5 @@ fn test_config_clone() {
     assert_eq!(config.rpc_proxy_url, cloned.rpc_proxy_url);
     assert_eq!(config.etherscan_api_key, cloned.etherscan_api_key);
     assert_eq!(config.quick, cloned.quick);
+    assert_eq!(config.precompute_state_variables, cloned.precompute_state_variables);
 }
