@@ -103,7 +103,9 @@ where
                 // SLOAD
                 0x54 => {
                     if let Some(slot) = stack.peek(0) {
-                        if let Ok(value) = opcode_snapshot.database.storage_ref(target_address, *slot) {
+                        if let Ok(value) =
+                            opcode_snapshot.database.storage_ref(target_address, *slot)
+                        {
                             storage_read = Some(StorageAccess { slot: *slot, value });
                         }
                     }

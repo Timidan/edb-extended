@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "crates/engine/",
-    "crates/tui/",
     "crates/edb/",
     "crates/edb-simulator/",
     "crates/rpc-proxy/",
@@ -88,7 +87,6 @@ edb-engine = { version = "0.0.2", path = "crates/engine" }
 edb-common = { version = "0.0.2", path = "crates/common" }
 edb-rpc-proxy = { version = "0.0.2", path = "crates/rpc-proxy" }
 edb-integration-tests = { version = "0.0.2", path = "crates/integration-tests" }
-edb-tui = { version = "0.0.2", path = "crates/tui" }
 edb = { version = "0.0.2", path = "crates/edb" }
 
 # alloy - matching Foundry's versions exactly (updated to 1.1.2)

@@ -18,8 +18,7 @@
 //! instrumenting it, and generating snapshots for time travel debugging.
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fs,
+    env, fs,
     time::{Duration, Instant},
 };
 
@@ -98,10 +97,7 @@ pub async fn download_verified_source_code(
         .keys()
         .filter(|addr| addresses_with_code.contains(*addr))
         .count();
-    let skipped_no_code = replay_result
-        .visited_addresses
-        .len()
-        .saturating_sub(visited_with_code);
+    let skipped_no_code = replay_result.visited_addresses.len().saturating_sub(visited_with_code);
     if skipped_no_code > 0 {
         info!(
             "Skipping {} visited addresses without runtime bytecode (EOAs/precompiles)",
@@ -109,25 +105,72 @@ pub async fn download_verified_source_code(
         );
     }
 
-    // Filter out addresses that already have artifacts and those without bytecode
-    let addresses: Vec<_> = replay_result
+    // Build a deterministic address order with execution-order priority:
+    // 1) addresses as they first appear in the execution trace
+    // 2) remaining visited addresses (sorted)
+    let mut ordered_addresses = Vec::new();
+    let mut seen_addresses: HashSet<Address> = HashSet::new();
+
+    for entry in &replay_result.execution_trace {
+        let address = entry.code_address;
+        if address == Address::ZERO {
+            continue;
+        }
+        if !addresses_with_code.contains(&address) {
+            continue;
+        }
+        if seen_addresses.insert(address) {
+            ordered_addresses.push(address);
+        }
+    }
+
+    let mut remaining_addresses: Vec<Address> = replay_result
         .visited_addresses
         .keys()
         .filter(|addr| addresses_with_code.contains(*addr))
-        .filter(|addr| !artifacts.contains_key(*addr))
         .copied()
+        .filter(|addr| !seen_addresses.contains(addr))
         .collect();
+    remaining_addresses.sort_unstable();
+    ordered_addresses.extend(remaining_addresses);
+
+    // Filter out addresses that already have artifacts.
+    let mut addresses: Vec<Address> =
+        ordered_addresses.into_iter().filter(|addr| !artifacts.contains_key(addr)).collect();
+
+    // In keep-alive debug flows, limit source fetch/instrumentation scope to
+    // bound startup latency and memory. Defaults to 12 contracts, configurable.
+    let debug_source_cap = env::var("EDB_DEBUG_MAX_SOURCE_CONTRACTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(12);
+    if config.collect_hook_snapshots && debug_source_cap > 0 && addresses.len() > debug_source_cap {
+        let skipped = addresses.len() - debug_source_cap;
+        warn!(
+            "Debug source fetch capped to {} contract(s) (skipping {} lower-priority addresses). \
+             Set EDB_DEBUG_MAX_SOURCE_CONTRACTS to tune this.",
+            debug_source_cap, skipped
+        );
+        addresses.truncate(debug_source_cap);
+    }
+
     let total_contracts = addresses.len();
 
     if total_contracts == 0 {
-        info!("All {} addresses already have pre-loaded artifacts, skipping download", preloaded_count);
+        info!(
+            "All {} addresses already have pre-loaded artifacts, skipping download",
+            preloaded_count
+        );
         return Ok(artifacts);
     }
 
     // Log all addresses that will be downloaded
-    info!("Will download artifacts for {} addresses (skipping {} pre-loaded): {:?}",
-          total_contracts, preloaded_count,
-          addresses.iter().map(|a| format!("{:#x}", a)).collect::<Vec<_>>());
+    info!(
+        "Will download artifacts for {} addresses (skipping {} pre-loaded): {:?}",
+        total_contracts,
+        preloaded_count,
+        addresses.iter().map(|a| format!("{:#x}", a)).collect::<Vec<_>>()
+    );
 
     let console_bar = std::sync::Arc::new(ProgressBar::new(total_contracts as u64));
     console_bar.set_style(
@@ -143,6 +186,33 @@ pub async fn download_verified_source_code(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_ETHERSCAN_CACHE_TTL);
 
+    let first_source_hint =
+        config.artifact_source_priority.first().map(|entry| entry.to_ascii_lowercase());
+    let has_etherscan_key = !config.get_etherscan_api_key().trim().is_empty();
+    let prefer_etherscan_first = match first_source_hint.as_deref() {
+        Some("etherscan") | Some("blockscout") => true,
+        Some("sourcify") => false,
+        Some(_) => false,
+        // Default to etherscan-first when an API key is available.
+        // Sourcify remains the fallback for misses/unsupported contracts.
+        None => has_etherscan_key,
+    };
+    if let Some(hint) = first_source_hint.as_deref() {
+        info!(
+            "Artifact source priority hint from FE: {} (download order: {} -> {})",
+            hint,
+            if prefer_etherscan_first { "etherscan" } else { "sourcify" },
+            if prefer_etherscan_first { "sourcify" } else { "etherscan" }
+        );
+    } else if has_etherscan_key {
+        info!(
+            "No artifact source priority hint from FE; defaulting to etherscan-first (API key available)"
+        );
+    }
+    if matches!(first_source_hint.as_deref(), Some("blockscout")) {
+        info!("Mapping FE 'blockscout' hint to etherscan-compatible fetch path in engine");
+    }
+
     // Create all download futures
     let download_futures = addresses.iter().map(|address| {
         let pb = console_bar.clone();
@@ -150,103 +220,236 @@ pub async fn download_verified_source_code(
         let etherscan_cache_root = etherscan_cache_root.clone();
         let compiler = compiler.clone();
         let chain_id = chain_id;
+        let prefer_etherscan_first = prefer_etherscan_first;
 
         async move {
             let contract_start = Instant::now();
             let short_addr = &address.to_string()[2..10]; // Skip 0x, take 8 chars
             pb.set_message(format!("Downloading: 0x{short_addr}..."));
 
-            // 1) Try Sourcify (partial/full match) to get metadata and sources
-            let sourcify_start = Instant::now();
-            let result = match crate::utils::sourcify::fetch_artifact_from_sourcify(chain_id, *address).await {
-                Ok(Some(artifact)) => {
-                    info!("[TIMING] Contract {} sourcify fetch: {:.2}s", address, sourcify_start.elapsed().as_secs_f64());
-                    pb.set_message(format!("✅ 0x{short_addr}... sourcify"));
-                    Some(artifact)
+            let result = if prefer_etherscan_first {
+                let etherscan_start = Instant::now();
+                let mut builder = Client::builder()
+                    .with_api_key(api_key.clone())
+                    .with_cache(etherscan_cache_root.clone(), Duration::from_secs(cache_ttl))
+                    .chain(chain_id.into())?;
+                if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
+                    builder = builder.with_api_url(v2_url)?;
                 }
-                Ok(None) => {
-                    info!("[TIMING] Contract {} sourcify miss: {:.2}s, trying etherscan", address, sourcify_start.elapsed().as_secs_f64());
-                    // Fallback to chain-native Etherscan-compatible API (e.g., api.basescan.org)
-                    // V2 unified API requires Pro-tier API key for multi-chain access.
-                    // The alloy-chains library incorrectly maps some chains (Base, Fraxtal, etc.)
-                    // to the V2 API, so we need to override those here.
-                    let etherscan_start = Instant::now();
-                    let mut builder = Client::builder()
-                        .with_api_key(api_key)
-                        .with_cache(etherscan_cache_root, Duration::from_secs(cache_ttl))
-                        .chain(chain_id.into())?;
+                let etherscan = builder.build()?;
 
-                    // Override API URL for chains that have migrated to Etherscan V2 unified API
-                    // (chain-native APIs like api.basescan.org are deprecated and no longer work)
-                    if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
-                        builder = builder.with_api_url(v2_url)?;
+                match compiler.compile(&etherscan, *address).await {
+                    Ok(Some(artifact)) => {
+                        info!(
+                            "[TIMING] Contract {} etherscan+compile: {:.2}s",
+                            address,
+                            etherscan_start.elapsed().as_secs_f64()
+                        );
+                        pb.set_message(format!("✅ 0x{short_addr}... etherscan"));
+                        Some(artifact)
                     }
-
-                    let etherscan = builder.build()?;
-
-                    match compiler.compile(&etherscan, *address).await {
-                        Ok(Some(artifact)) => {
-                            info!("[TIMING] Contract {} etherscan+compile: {:.2}s", address, etherscan_start.elapsed().as_secs_f64());
-                            pb.set_message(format!("✅ 0x{short_addr}... compiled"));
-                            Some(artifact)
+                    Ok(None) => {
+                        info!(
+                            "[TIMING] Contract {} etherscan no source: {:.2}s, trying sourcify",
+                            address,
+                            etherscan_start.elapsed().as_secs_f64()
+                        );
+                        let sourcify_start = Instant::now();
+                        match crate::utils::sourcify::fetch_artifact_from_sourcify(
+                            chain_id, *address,
+                        )
+                        .await
+                        {
+                            Ok(Some(artifact)) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify fetch: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("✅ 0x{short_addr}... sourcify"));
+                                Some(artifact)
+                            }
+                            Ok(None) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify miss: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("⚠️  0x{short_addr}... no source"));
+                                debug!("No source code available for contract {}", address);
+                                None
+                            }
+                            Err(e) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify error: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("❌ 0x{short_addr}... failed"));
+                                warn!("Sourcify fetch failed for {}: {:?}", address, e);
+                                None
+                            }
                         }
-                        Ok(None) => {
-                            info!("[TIMING] Contract {} etherscan no source: {:.2}s", address, etherscan_start.elapsed().as_secs_f64());
-                            pb.set_message(format!("⚠️  0x{short_addr}... no source"));
-                            debug!("No source code available for contract {}", address);
-                            None
-                        }
-                        Err(e) => {
-                            info!("[TIMING] Contract {} etherscan failed: {:.2}s", address, etherscan_start.elapsed().as_secs_f64());
-                            pb.set_message(format!("❌ 0x{short_addr}... failed"));
-                            warn!("Failed to compile contract {}: {:?}", address, e);
-                            None
+                    }
+                    Err(e) => {
+                        info!(
+                            "[TIMING] Contract {} etherscan failed: {:.2}s, trying sourcify",
+                            address,
+                            etherscan_start.elapsed().as_secs_f64()
+                        );
+                        warn!("Failed to compile contract {} via etherscan: {:?}", address, e);
+                        let sourcify_start = Instant::now();
+                        match crate::utils::sourcify::fetch_artifact_from_sourcify(
+                            chain_id, *address,
+                        )
+                        .await
+                        {
+                            Ok(Some(artifact)) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify fetch: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("✅ 0x{short_addr}... sourcify"));
+                                Some(artifact)
+                            }
+                            Ok(None) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify miss: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("⚠️  0x{short_addr}... no source"));
+                                debug!("No source code available for contract {}", address);
+                                None
+                            }
+                            Err(e) => {
+                                info!(
+                                    "[TIMING] Contract {} sourcify error: {:.2}s",
+                                    address,
+                                    sourcify_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("❌ 0x{short_addr}... failed"));
+                                warn!("Sourcify fetch failed for {}: {:?}", address, e);
+                                None
+                            }
                         }
                     }
                 }
-                Err(e) => {
-                    // Sourcify error (network issue, etc.) - also fallback to Etherscan
-                    info!("[TIMING] Contract {} sourcify error: {:.2}s, falling back", address, sourcify_start.elapsed().as_secs_f64());
-                    warn!("Sourcify fetch failed for {}, falling back to Etherscan: {:?}", address, e);
-
-                    // Fallback to chain-native Etherscan-compatible API (e.g., api.basescan.org)
-                    // The alloy-chains library incorrectly maps some chains (Base, Fraxtal, etc.)
-                    // to the V2 API, so we need to override those here.
-                    let etherscan_start = Instant::now();
-                    let mut builder = Client::builder()
-                        .with_api_key(api_key.clone())
-                        .with_cache(etherscan_cache_root.clone(), Duration::from_secs(cache_ttl))
-                        .chain(chain_id.into())?;
-
-                    // Override API URL for chains that have migrated to Etherscan V2 unified API
-                    // (chain-native APIs like api.basescan.org are deprecated and no longer work)
-                    if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
-                        builder = builder.with_api_url(v2_url)?;
+            } else {
+                // Default order: Sourcify first, then etherscan fallback.
+                let sourcify_start = Instant::now();
+                match crate::utils::sourcify::fetch_artifact_from_sourcify(chain_id, *address).await
+                {
+                    Ok(Some(artifact)) => {
+                        info!(
+                            "[TIMING] Contract {} sourcify fetch: {:.2}s",
+                            address,
+                            sourcify_start.elapsed().as_secs_f64()
+                        );
+                        pb.set_message(format!("✅ 0x{short_addr}... sourcify"));
+                        Some(artifact)
                     }
-
-                    let etherscan = builder.build()?;
-
-                    match compiler.compile(&etherscan, *address).await {
-                        Ok(Some(artifact)) => {
-                            info!("[TIMING] Contract {} etherscan fallback: {:.2}s", address, etherscan_start.elapsed().as_secs_f64());
-                            pb.set_message(format!("✅ 0x{short_addr}... etherscan"));
-                            Some(artifact)
+                    Ok(None) => {
+                        info!(
+                            "[TIMING] Contract {} sourcify miss: {:.2}s, trying etherscan",
+                            address,
+                            sourcify_start.elapsed().as_secs_f64()
+                        );
+                        let etherscan_start = Instant::now();
+                        let mut builder = Client::builder()
+                            .with_api_key(api_key)
+                            .with_cache(etherscan_cache_root, Duration::from_secs(cache_ttl))
+                            .chain(chain_id.into())?;
+                        if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
+                            builder = builder.with_api_url(v2_url)?;
                         }
-                        Ok(None) => {
-                            pb.set_message(format!("⚠️  0x{short_addr}... no source"));
-                            debug!("No source code available for contract {}", address);
-                            None
+                        let etherscan = builder.build()?;
+                        match compiler.compile(&etherscan, *address).await {
+                            Ok(Some(artifact)) => {
+                                info!(
+                                    "[TIMING] Contract {} etherscan+compile: {:.2}s",
+                                    address,
+                                    etherscan_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("✅ 0x{short_addr}... compiled"));
+                                Some(artifact)
+                            }
+                            Ok(None) => {
+                                info!(
+                                    "[TIMING] Contract {} etherscan no source: {:.2}s",
+                                    address,
+                                    etherscan_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("⚠️  0x{short_addr}... no source"));
+                                debug!("No source code available for contract {}", address);
+                                None
+                            }
+                            Err(e) => {
+                                info!(
+                                    "[TIMING] Contract {} etherscan failed: {:.2}s",
+                                    address,
+                                    etherscan_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("❌ 0x{short_addr}... failed"));
+                                warn!("Failed to compile contract {}: {:?}", address, e);
+                                None
+                            }
                         }
-                        Err(e) => {
-                            pb.set_message(format!("❌ 0x{short_addr}... failed"));
-                            warn!("Failed to compile contract {}: {:?}", address, e);
-                            None
+                    }
+                    Err(e) => {
+                        // Sourcify error (network issue, etc.) - also fallback to Etherscan
+                        info!(
+                            "[TIMING] Contract {} sourcify error: {:.2}s, falling back",
+                            address,
+                            sourcify_start.elapsed().as_secs_f64()
+                        );
+                        warn!(
+                            "Sourcify fetch failed for {}, falling back to Etherscan: {:?}",
+                            address, e
+                        );
+                        let etherscan_start = Instant::now();
+                        let mut builder = Client::builder()
+                            .with_api_key(api_key.clone())
+                            .with_cache(
+                                etherscan_cache_root.clone(),
+                                Duration::from_secs(cache_ttl),
+                            )
+                            .chain(chain_id.into())?;
+                        if let Some(v2_url) = get_etherscan_v2_api_url(chain_id) {
+                            builder = builder.with_api_url(v2_url)?;
+                        }
+                        let etherscan = builder.build()?;
+                        match compiler.compile(&etherscan, *address).await {
+                            Ok(Some(artifact)) => {
+                                info!(
+                                    "[TIMING] Contract {} etherscan fallback: {:.2}s",
+                                    address,
+                                    etherscan_start.elapsed().as_secs_f64()
+                                );
+                                pb.set_message(format!("✅ 0x{short_addr}... etherscan"));
+                                Some(artifact)
+                            }
+                            Ok(None) => {
+                                pb.set_message(format!("⚠️  0x{short_addr}... no source"));
+                                debug!("No source code available for contract {}", address);
+                                None
+                            }
+                            Err(e) => {
+                                pb.set_message(format!("❌ 0x{short_addr}... failed"));
+                                warn!("Failed to compile contract {}: {:?}", address, e);
+                                None
+                            }
                         }
                     }
                 }
             };
 
-            info!("[TIMING] Contract {} total download: {:.2}s", address, contract_start.elapsed().as_secs_f64());
+            info!(
+                "[TIMING] Contract {} total download: {:.2}s",
+                address,
+                contract_start.elapsed().as_secs_f64()
+            );
             pb.inc(1);
             Ok::<(Address, Option<Artifact>), eyre::Error>((*address, result))
         }
@@ -268,9 +471,7 @@ pub async fn download_verified_source_code(
 
     console_bar.finish_with_message(format!(
         "✨ Done! Compiled {} out of {} contracts (+ {} pre-loaded)",
-        downloaded_count,
-        total_contracts,
-        preloaded_count
+        downloaded_count, total_contracts, preloaded_count
     ));
 
     Ok(artifacts)
@@ -285,10 +486,8 @@ pub fn instrument_and_recompile_source_code(
 
     // Filter to only process contracts that have analysis results
     // Contracts without analysis results (e.g., due to AST parsing errors) will use opcode-level traces
-    let contracts_with_analysis: Vec<_> = artifacts
-        .iter()
-        .filter(|(address, _)| analysis_result.contains_key(*address))
-        .collect();
+    let contracts_with_analysis: Vec<_> =
+        artifacts.iter().filter(|(address, _)| analysis_result.contains_key(*address)).collect();
 
     let skipped_count = artifacts.len() - contracts_with_analysis.len();
     if skipped_count > 0 {

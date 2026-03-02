@@ -76,6 +76,15 @@ pub struct EngineConfig {
     pub quick: bool,
     /// Precompute state variables for hook snapshots during context finalization
     pub precompute_state_variables: bool,
+    /// Collect hook snapshots by tweaking bytecode and replaying instrumented execution.
+    /// Disable this for non-debug flows to avoid heavy preparation overhead.
+    pub collect_hook_snapshots: bool,
+    /// Preferred artifact source priority hint from frontend/config.
+    /// Expected values: "sourcify", "etherscan", "blockscout".
+    pub artifact_source_priority: Vec<String>,
+    /// Capture only significant opcodes during opcode snapshot pass.
+    /// This keeps V3 render parity-critical opcodes while cutting non-debug replay cost.
+    pub significant_opcode_snapshots_only: bool,
 }
 
 impl Default for EngineConfig {
@@ -85,6 +94,9 @@ impl Default for EngineConfig {
             etherscan_api_key: None,
             quick: false,
             precompute_state_variables: true,
+            collect_hook_snapshots: true,
+            artifact_source_priority: Vec::new(),
+            significant_opcode_snapshots_only: false,
         }
     }
 }
@@ -105,6 +117,27 @@ impl EngineConfig {
     /// Enable or disable state variable precomputation during context finalization
     pub fn with_precompute_state_variables(mut self, precompute_state_variables: bool) -> Self {
         self.precompute_state_variables = precompute_state_variables;
+        self
+    }
+
+    /// Enable or disable hook snapshot collection during engine preparation
+    pub fn with_collect_hook_snapshots(mut self, collect_hook_snapshots: bool) -> Self {
+        self.collect_hook_snapshots = collect_hook_snapshots;
+        self
+    }
+
+    /// Set preferred artifact source priority hint for runtime-discovered contracts.
+    pub fn with_artifact_source_priority(mut self, artifact_source_priority: Vec<String>) -> Self {
+        self.artifact_source_priority = artifact_source_priority;
+        self
+    }
+
+    /// Enable significant-opcode-only mode for opcode snapshot capture.
+    pub fn with_significant_opcode_snapshots_only(
+        mut self,
+        significant_opcode_snapshots_only: bool,
+    ) -> Self {
+        self.significant_opcode_snapshots_only = significant_opcode_snapshots_only;
         self
     }
 
@@ -201,7 +234,9 @@ impl Engine {
         &self,
         fork_result: ForkResult<DB>,
         progress_tx: Option<mpsc::UnboundedSender<edb_common::ProgressMessage>>,
-        preloaded_artifacts: Option<std::collections::HashMap<alloy_primitives::Address, crate::Artifact>>,
+        preloaded_artifacts: Option<
+            std::collections::HashMap<alloy_primitives::Address, crate::Artifact>,
+        >,
     ) -> Result<SocketAddr>
     where
         DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
@@ -262,8 +297,17 @@ impl Engine {
             "Replaying the target transaction to collect call trace and touched contracts..."
         );
         let step_start = Instant::now();
-        let replay_result = orchestration::replay_and_collect_trace(ctx.clone(), tx.clone())?;
-        info!("[TIMING] Step 1 - replay_and_collect_trace: {:.2}s", step_start.elapsed().as_secs_f64());
+        let (replay_result, precollected_opcode_snapshots) =
+            orchestration::replay_and_collect_trace_and_opcode_snapshots(
+                ctx.clone(),
+                tx.clone(),
+                HashSet::new(),
+                self.config.significant_opcode_snapshots_only,
+            )?;
+        info!(
+            "[TIMING] Step 1 - replay_and_collect_trace: {:.2}s",
+            step_start.elapsed().as_secs_f64()
+        );
 
         // Step 2: Download verified source code for each contract
         // (skipping addresses that have pre-loaded artifacts from frontend)
@@ -276,7 +320,11 @@ impl Engine {
             preloaded_artifacts,
         )
         .await?;
-        info!("[TIMING] Step 2 - download_verified_source_code: {:.2}s ({} contracts)", step_start.elapsed().as_secs_f64(), artifacts.len());
+        info!(
+            "[TIMING] Step 2 - download_verified_source_code: {:.2}s ({} contracts)",
+            step_start.elapsed().as_secs_f64(),
+            artifacts.len()
+        );
 
         // Log degradation warning if no artifacts found - we'll still get opcode-level traces
         let touched_contracts = replay_result.visited_addresses.len();
@@ -301,78 +349,99 @@ impl Engine {
         let analysis_results = orchestration::analyze_source_code(&artifacts)?;
         info!("[TIMING] Step 3 - analyze_source_code: {:.2}s", step_start.elapsed().as_secs_f64());
 
-        // Step 4: Instrument source code
-        send_progress!(4, 8, "Instrumenting source code...");
-        let step_start = Instant::now();
-        let recompiled_artifacts =
-            orchestration::instrument_and_recompile_source_code(&artifacts, &analysis_results)?;
-        info!("[TIMING] Step 4 - instrument_and_recompile: {:.2}s", step_start.elapsed().as_secs_f64());
+        // Step 4: Instrument source code (debug/hook pipeline only).
+        // Non-debug simulations can render V3 traces from canonical artifacts + opcode snapshots.
+        let recompiled_artifacts = if self.config.collect_hook_snapshots {
+            send_progress!(4, 8, "Instrumenting source code...");
+            let step_start = Instant::now();
+            let recompiled =
+                orchestration::instrument_and_recompile_source_code(&artifacts, &analysis_results)?;
+            info!(
+                "[TIMING] Step 4 - instrument_and_recompile: {:.2}s",
+                step_start.elapsed().as_secs_f64()
+            );
+            recompiled
+        } else {
+            send_progress!(4, 8, "Skipping instrumentation for non-debug simulation...");
+            info!("[PERF] Skipping Step 4 - instrument_and_recompile");
+            Default::default()
+        };
 
         // Step 5: Collect opcode-level step execution results
         send_progress!(5, 8, "Collecting opcode-level step execution results...");
         let step_start = Instant::now();
-        // Collect opcode snapshots for all touched contracts (do not exclude verified ones)
-        let opcode_snapshots = orchestration::capture_opcode_level_snapshots(
-            ctx.clone(),
-            tx.clone(),
-            HashSet::new(),
-            &replay_result.execution_trace,
-        )?;
-        info!("[TIMING] Step 5 - capture_opcode_level_snapshots: {:.2}s", step_start.elapsed().as_secs_f64());
+        // Reuse snapshots captured during replay to avoid a second full transaction execution.
+        let opcode_snapshots = precollected_opcode_snapshots;
+        info!(
+            "[TIMING] Step 5 - capture_opcode_level_snapshots: {:.2}s (reused from Step 1)",
+            step_start.elapsed().as_secs_f64()
+        );
 
-        // Step 6: Replace original bytecode with instrumented versions
-        send_progress!(6, 8, "Replacing original bytecode with instrumented versions...");
-        let step_start = Instant::now();
-        let contracts_in_tx = orchestration::tweak_bytecode(
-            &self.config,
-            &mut ctx,
-            &artifacts,
-            &recompiled_artifacts,
-            tx_hash,
-        )
-        .await?;
-        info!("[TIMING] Step 6 - tweak_bytecode: {:.2}s", step_start.elapsed().as_secs_f64());
+        // Step 6/7: Optional hook snapshot pipeline (expensive; required for full debug sessions)
+        let hook_snapshots = if self.config.collect_hook_snapshots {
+            // Step 6: Replace original bytecode with instrumented versions
+            send_progress!(6, 8, "Replacing original bytecode with instrumented versions...");
+            let step_start = Instant::now();
+            let contracts_in_tx = orchestration::tweak_bytecode(
+                &self.config,
+                &mut ctx,
+                &artifacts,
+                &recompiled_artifacts,
+                tx_hash,
+            )
+            .await?;
+            info!("[TIMING] Step 6 - tweak_bytecode: {:.2}s", step_start.elapsed().as_secs_f64());
 
-        // Step 7: Re-execute the transaction with snapshot collection
-        send_progress!(7, 8, "Collecting creation hooks for contracts in transaction...");
-        let step_start = Instant::now();
-        let hook_creation = orchestration::collect_creation_hooks(
-            &artifacts,
-            &recompiled_artifacts,
-            contracts_in_tx,
-        )?;
-        // Use catch_unwind to gracefully handle panics during hook snapshot collection
-        // (Diamond contracts with many facets can trigger panics in REVM)
-        let hook_snapshots = {
-            let ctx_clone = ctx.clone();
-            let tx_clone = tx.clone();
-            let trace_ref = &replay_result.execution_trace;
-            let analysis_ref = &analysis_results;
+            // Step 7: Re-execute the transaction with hook snapshot collection
+            send_progress!(7, 8, "Collecting creation hooks for contracts in transaction...");
+            let step_start = Instant::now();
+            let hook_creation = orchestration::collect_creation_hooks(
+                &artifacts,
+                &recompiled_artifacts,
+                contracts_in_tx,
+            )?;
+            // Use catch_unwind to gracefully handle panics during hook snapshot collection
+            // (Diamond contracts with many facets can trigger panics in REVM)
+            let snapshots = {
+                let ctx_clone = ctx.clone();
+                let tx_clone = tx.clone();
+                let trace_ref = &replay_result.execution_trace;
+                let analysis_ref = &analysis_results;
 
-            match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                orchestration::capture_hook_snapshots(
-                    ctx_clone,
-                    tx_clone,
-                    hook_creation,
-                    trace_ref,
-                    analysis_ref,
-                )
-            })) {
-                Ok(Ok(snapshots)) => snapshots,
-                Ok(Err(e)) => {
-                    warn!("Hook snapshot collection failed: {e:?}. Using opcode-level snapshots only.");
-                    crate::HookSnapshots::default()
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    orchestration::capture_hook_snapshots(
+                        ctx_clone,
+                        tx_clone,
+                        hook_creation,
+                        trace_ref,
+                        analysis_ref,
+                    )
+                })) {
+                    Ok(Ok(snapshots)) => snapshots,
+                    Ok(Err(e)) => {
+                        warn!("Hook snapshot collection failed: {e:?}. Using opcode-level snapshots only.");
+                        crate::HookSnapshots::default()
+                    }
+                    Err(panic_info) => {
+                        warn!(
+                            "Hook snapshot collection panicked: {:?}. Using opcode-level snapshots only.",
+                            panic_info.downcast_ref::<&str>().unwrap_or(&"unknown panic")
+                        );
+                        crate::HookSnapshots::default()
+                    }
                 }
-                Err(panic_info) => {
-                    warn!(
-                        "Hook snapshot collection panicked: {:?}. Using opcode-level snapshots only.",
-                        panic_info.downcast_ref::<&str>().unwrap_or(&"unknown panic")
-                    );
-                    crate::HookSnapshots::default()
-                }
-            }
+            };
+            info!(
+                "[TIMING] Step 7 - capture_hook_snapshots: {:.2}s",
+                step_start.elapsed().as_secs_f64()
+            );
+            snapshots
+        } else {
+            send_progress!(6, 8, "Skipping bytecode tweak for non-debug simulation...");
+            send_progress!(7, 8, "Skipping hook snapshot collection for non-debug simulation...");
+            info!("[PERF] Skipping Step 6/7 (tweak_bytecode + capture_hook_snapshots)");
+            crate::HookSnapshots::default()
         };
-        info!("[TIMING] Step 7 - capture_hook_snapshots: {:.2}s", step_start.elapsed().as_secs_f64());
 
         // Step 8: Start RPC server with analysis results and snapshots
         send_progress!(8, 8, "Collecting opcode-level and hook-level snapshots...");
@@ -387,13 +456,15 @@ impl Engine {
                  Opcode-level trace data is still available for debugging."
             );
         }
-        info!("[TIMING] Step 8 - get_time_travel_snapshots + analyze: {:.2}s", step_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Step 8 - get_time_travel_snapshots + analyze: {:.2}s",
+            step_start.elapsed().as_secs_f64()
+        );
 
         // Let's pack the debug context
         let step_start = Instant::now();
-        let finalize_options = FinalizeOptions {
-            precompute_state_variables: self.config.precompute_state_variables,
-        };
+        let finalize_options =
+            FinalizeOptions { precompute_state_variables: self.config.precompute_state_variables };
         if !finalize_options.precompute_state_variables {
             info!("[PERF] Skipping hook snapshot state-variable precompute");
         }
@@ -412,7 +483,10 @@ impl Engine {
         )?;
 
         let rpc_handle = start_debug_server(context).await?;
-        info!("[TIMING] Step 9 - build_context + start_debug_server: {:.2}s", step_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Step 9 - build_context + start_debug_server: {:.2}s",
+            step_start.elapsed().as_secs_f64()
+        );
         info!("[TIMING] TOTAL engine.prepare(): {:.2}s", engine_start.elapsed().as_secs_f64());
         info!("Debug RPC server started on {}", rpc_handle.addr());
 

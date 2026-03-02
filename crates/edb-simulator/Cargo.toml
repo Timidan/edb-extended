@@ -25,6 +25,7 @@ alloy-eips = { workspace = true }
 foundry-compilers = { workspace = true }
 foundry-block-explorers = { workspace = true }
 semver = { workspace = true }
+rayon = { workspace = true }
 revm = { workspace = true, features = [
     "std",
     "serde",

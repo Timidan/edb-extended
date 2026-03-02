@@ -8,18 +8,18 @@ use edb_common::{
     fork_and_prepare, get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id,
     relax_evm_constraints, EdbDB, ForkInfo, ForkResult,
 };
-use edb_engine::{Artifact, CallTracer, Engine, EngineConfig, find_or_install_solc};
+use edb_engine::{find_or_install_solc, Artifact, CallTracer, Engine, EngineConfig};
+use eyre::WrapErr;
+use foundry_block_explorers::contract::Metadata as EtherscanMetadata;
 use foundry_compilers::artifacts::{
     output_selection::OutputSelection, CompilerOutput, Settings, SolcInput, Source, Sources,
 };
 use foundry_compilers::solc::SolcLanguage;
-use foundry_block_explorers::contract::Metadata as EtherscanMetadata;
-use std::collections::HashMap;
-use eyre::WrapErr;
+use rayon::prelude::*;
 use reqwest::Client;
 use revm::{
-    context::TxEnv,
     context::result::ExecutionResult,
+    context::TxEnv,
     context_interface::block::BlobExcessGasAndPrice,
     database::{AlloyDB, CacheDB},
     database_interface::WrapDatabaseAsync,
@@ -28,9 +28,11 @@ use revm::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -56,6 +58,7 @@ enum SimulationMode {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct SimulationJob {
     mode: SimulationMode,
@@ -74,6 +77,8 @@ struct SimulationJob {
     #[serde(default)]
     analysis_options: AnalysisOptions,
     #[serde(default)]
+    debug_session_only: bool,
+    #[serde(default)]
     artifact_path: Option<String>,
     #[serde(default, alias = "artifacts_inline")]
     artifacts_inline: Option<Value>,
@@ -91,6 +96,7 @@ struct TransactionPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct SourceArtifact {
     contract_name: String,
@@ -100,6 +106,7 @@ struct SourceArtifact {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct ContractSource {
     path: String,
@@ -107,6 +114,7 @@ struct ContractSource {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct StorageOverride {
     address: String,
@@ -115,6 +123,7 @@ struct StorageOverride {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct AnalysisOptions {
     #[serde(default)]
@@ -129,6 +138,8 @@ struct AnalysisOptions {
     collect_snapshots: bool,
     #[serde(default)]
     etherscan_api_key: Option<String>,
+    #[serde(default)]
+    artifact_source_priority: Vec<String>,
 }
 
 /// Debug session info returned when --keep-alive is used
@@ -143,6 +154,7 @@ struct DebugSession {
 /// Indicates the quality level of trace data returned.
 /// Higher levels provide more detailed debugging information.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "kebab-case")]
 enum DebugLevel {
     /// Full source-level debugging with instrumented bytecode and variable tracking
@@ -166,6 +178,10 @@ struct SimulationResult {
     gas_used: Option<String>,
     gas_limit_suggested: Option<String>,
     raw_trace: Option<Value>,
+    /// Fully decoded trace rows from Rust engine (schema version 3).
+    /// When present, the frontend can skip all TypeScript decode logic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendered_trace: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     debug_session: Option<DebugSession>,
     /// Indicates the quality level of trace data returned.
@@ -175,6 +191,7 @@ struct SimulationResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcResponse<T> {
     jsonrpc: String,
     result: Option<T>,
@@ -183,11 +200,22 @@ struct JsonRpcResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcError {
     code: i64,
     message: String,
     #[serde(default)]
     data: Option<Value>,
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => default,
+    }
 }
 
 #[tokio::main]
@@ -211,6 +239,7 @@ async fn main() {
             gas_used: None,
             gas_limit_suggested: None,
             raw_trace: None,
+            rendered_trace: None,
             debug_session: None,
             debug_level: None, // Error case - no trace data available
         };
@@ -221,12 +250,418 @@ async fn main() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OpcodeStep {
+    idx: usize,
+    pc: usize,
+    op: u8,
+}
+
+fn decode_hex_bytecode(bytecode_hex: &str) -> Option<Vec<u8>> {
+    let normalized = bytecode_hex.trim_start_matches("0x");
+    if normalized.is_empty() {
+        return None;
+    }
+    hex::decode(normalized).ok()
+}
+
+fn build_opcode_steps(bytes: &[u8]) -> Vec<OpcodeStep> {
+    let mut steps = Vec::new();
+    let mut pc = 0usize;
+    let mut idx = 0usize;
+    while pc < bytes.len() {
+        let op = bytes[pc];
+        steps.push(OpcodeStep { idx, pc, op });
+        let push_len = if (0x60..=0x7f).contains(&op) { (op - 0x5f) as usize } else { 0 };
+        pc += 1 + push_len;
+        idx += 1;
+    }
+    steps
+}
+
+fn gather_runtime_bytecodes(value: &Value, out: &mut HashMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            let addr =
+                map.get("code_address").or_else(|| map.get("codeAddress")).and_then(Value::as_str);
+            let bytecode = map.get("bytecode").and_then(Value::as_str);
+            if let (Some(addr), Some(bytecode)) = (addr, bytecode) {
+                let key = addr.to_lowercase();
+                let incoming_len = bytecode.trim_start_matches("0x").len();
+                match out.get_mut(&key) {
+                    Some(existing) => {
+                        let existing_len = existing.trim_start_matches("0x").len();
+                        if incoming_len > existing_len {
+                            *existing = bytecode.to_string();
+                        }
+                    }
+                    None => {
+                        out.insert(key, bytecode.to_string());
+                    }
+                }
+            }
+            for nested in map.values() {
+                gather_runtime_bytecodes(nested, out);
+            }
+        }
+        Value::Array(arr) => {
+            for nested in arr {
+                gather_runtime_bytecodes(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ObservedOpcodeStep {
+    pc: usize,
+    op: u8,
+}
+
+fn parse_trace_id(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().map(|v| v as i64))
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+fn gather_trace_id_code_addresses(value: &Value, out: &mut HashMap<i64, String>) {
+    match value {
+        Value::Object(map) => {
+            let trace_id = map.get("id").or_else(|| map.get("trace_id")).and_then(parse_trace_id);
+            let code_addr = map
+                .get("code_address")
+                .or_else(|| map.get("codeAddress"))
+                .or_else(|| map.get("target"))
+                .and_then(Value::as_str)
+                .map(|addr| addr.to_lowercase());
+            if let (Some(trace_id), Some(code_addr)) = (trace_id, code_addr) {
+                out.insert(trace_id, code_addr);
+            }
+            for nested in map.values() {
+                gather_trace_id_code_addresses(nested, out);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                gather_trace_id_code_addresses(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn gather_observed_opcode_steps(
+    snapshots: &Value,
+    trace_id_to_code_addr: &HashMap<i64, String>,
+) -> HashMap<String, Vec<ObservedOpcodeStep>> {
+    let mut out: HashMap<String, Vec<ObservedOpcodeStep>> = HashMap::new();
+    let snapshots_arr = match snapshots.as_array() {
+        Some(arr) => arr,
+        None => return out,
+    };
+
+    for snapshot in snapshots_arr {
+        let opcode_obj = snapshot
+            .get("detail")
+            .and_then(|detail| detail.get("Opcode").or_else(|| detail.get("opcode")));
+        let (pc, op) = if let Some(opcode) = opcode_obj {
+            let pc = opcode.get("pc").and_then(Value::as_u64).map(|v| v as usize);
+            let op = opcode.get("opcode").and_then(Value::as_u64).map(|v| v as u8);
+            match (pc, op) {
+                (Some(pc), Some(op)) => (pc, op),
+                _ => continue,
+            }
+        } else {
+            let pc = snapshot.get("pc").and_then(Value::as_u64).map(|v| v as usize);
+            let op = snapshot.get("opcode").and_then(Value::as_u64).map(|v| v as u8);
+            match (pc, op) {
+                (Some(pc), Some(op)) => (pc, op),
+                _ => continue,
+            }
+        };
+
+        let direct_addr = snapshot
+            .get("bytecode_address")
+            .or_else(|| snapshot.get("bytecodeAddress"))
+            .or_else(|| snapshot.get("code_address"))
+            .or_else(|| snapshot.get("codeAddress"))
+            .or_else(|| snapshot.get("target_address"))
+            .or_else(|| snapshot.get("targetAddress"))
+            .and_then(Value::as_str)
+            .map(|addr| addr.to_lowercase());
+
+        let frame_trace_id =
+            snapshot.get("frame_id").or_else(|| snapshot.get("frameId")).and_then(|frame| {
+                if let Some(arr) = frame.as_array() {
+                    arr.first().and_then(parse_trace_id)
+                } else {
+                    parse_trace_id(frame)
+                }
+            });
+
+        let code_addr = direct_addr.or_else(|| {
+            frame_trace_id.and_then(|trace_id| trace_id_to_code_addr.get(&trace_id).cloned())
+        });
+        let Some(code_addr) = code_addr else {
+            continue;
+        };
+
+        out.entry(code_addr).or_default().push(ObservedOpcodeStep { pc, op });
+    }
+
+    out
+}
+
+fn lcs_opcode_pairs(
+    runtime_ops: &[OpcodeStep],
+    artifact_ops: &[OpcodeStep],
+    max_cells: usize,
+) -> Option<Vec<(usize, usize)>> {
+    if runtime_ops.is_empty() || artifact_ops.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let rows = runtime_ops.len() + 1;
+    let cols = artifact_ops.len() + 1;
+    let cells = rows.checked_mul(cols)?;
+    if cells > max_cells {
+        return None;
+    }
+
+    let mut dp = vec![0u16; cells];
+    for i in (0..runtime_ops.len()).rev() {
+        for j in (0..artifact_ops.len()).rev() {
+            let idx = i * cols + j;
+            if runtime_ops[i].op == artifact_ops[j].op {
+                let diag = dp[(i + 1) * cols + (j + 1)] as u32 + 1;
+                dp[idx] = diag.min(u16::MAX as u32) as u16;
+            } else {
+                let down = dp[(i + 1) * cols + j];
+                let right = dp[i * cols + (j + 1)];
+                dp[idx] = down.max(right);
+            }
+        }
+    }
+
+    let mut pairs = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < runtime_ops.len() && j < artifact_ops.len() {
+        let here = dp[i * cols + j];
+        if runtime_ops[i].op == artifact_ops[j].op {
+            let diag = dp[(i + 1) * cols + (j + 1)];
+            if here == diag.saturating_add(1) {
+                pairs.push((i, j));
+                i += 1;
+                j += 1;
+                continue;
+            }
+        }
+
+        let down = dp[(i + 1) * cols + j];
+        let right = dp[i * cols + (j + 1)];
+        if down >= right {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    Some(pairs)
+}
+
+fn build_runtime_to_artifact_map(
+    runtime_len: usize,
+    artifact_len: usize,
+    anchors: &[(usize, usize)],
+) -> Vec<usize> {
+    if runtime_len == 0 || artifact_len == 0 {
+        return Vec::new();
+    }
+
+    if anchors.is_empty() {
+        if runtime_len == 1 {
+            return vec![0];
+        }
+        let max_art = artifact_len.saturating_sub(1);
+        return (0..runtime_len)
+            .map(|i| i.saturating_mul(max_art) / runtime_len.saturating_sub(1))
+            .collect();
+    }
+
+    let mut mapping = vec![0usize; runtime_len];
+    let max_art_idx = artifact_len.saturating_sub(1);
+
+    let (first_i, first_j) = anchors[0];
+    let head_bound = first_i.min(runtime_len - 1);
+    for mapped in mapping.iter_mut().take(head_bound + 1) {
+        *mapped = first_j.min(max_art_idx);
+    }
+
+    for pair in anchors.windows(2) {
+        let (left_i, left_j) = pair[0];
+        let (right_i, right_j) = pair[1];
+        if right_i <= left_i {
+            continue;
+        }
+
+        let span_i = right_i - left_i;
+        let span_j = right_j.saturating_sub(left_j);
+
+        let right_bound = right_i.min(runtime_len - 1);
+        for (idx, mapped_slot) in mapping.iter_mut().enumerate().take(right_bound + 1).skip(left_i)
+        {
+            let offset = idx.saturating_sub(left_i);
+            let mapped = left_j + (span_j.saturating_mul(offset) + span_i / 2) / span_i;
+            *mapped_slot = mapped.min(max_art_idx);
+        }
+    }
+
+    let (last_i, last_j) = anchors[anchors.len() - 1];
+    let tail_start = last_i.min(runtime_len - 1);
+    for mapped in mapping.iter_mut().skip(tail_start) {
+        *mapped = last_j.min(max_art_idx);
+    }
+
+    for i in 1..runtime_len {
+        if mapping[i] < mapping[i - 1] {
+            mapping[i] = mapping[i - 1];
+        }
+    }
+
+    mapping
+}
+
+fn build_runtime_to_artifact_map_by_opcode(
+    runtime_ops: &[OpcodeStep],
+    artifact_ops: &[OpcodeStep],
+) -> Vec<usize> {
+    if runtime_ops.is_empty() || artifact_ops.is_empty() {
+        return Vec::new();
+    }
+
+    let mut artifact_positions_by_op: HashMap<u8, Vec<usize>> = HashMap::new();
+    for step in artifact_ops {
+        artifact_positions_by_op.entry(step.op).or_default().push(step.idx);
+    }
+
+    let mut runtime_totals_by_op: HashMap<u8, usize> = HashMap::new();
+    for step in runtime_ops {
+        *runtime_totals_by_op.entry(step.op).or_insert(0) += 1;
+    }
+
+    let mut runtime_seen_by_op: HashMap<u8, usize> = HashMap::new();
+    let mut mapping = vec![0usize; runtime_ops.len()];
+    let runtime_len = runtime_ops.len();
+    let max_art = artifact_ops.len().saturating_sub(1);
+
+    for step in runtime_ops {
+        let seen = runtime_seen_by_op.entry(step.op).or_insert(0usize);
+        let occurrence_idx = *seen;
+        *seen += 1;
+
+        let mapped_idx = if let Some(candidates) = artifact_positions_by_op.get(&step.op) {
+            if candidates.len() == 1 {
+                candidates[0]
+            } else {
+                let total = *runtime_totals_by_op.get(&step.op).unwrap_or(&1usize);
+                let candidate_idx = if total > 1 {
+                    let numerator =
+                        occurrence_idx.saturating_mul(candidates.len().saturating_sub(1));
+                    let denominator = total.saturating_sub(1);
+                    ((numerator + denominator / 2) / denominator)
+                        .min(candidates.len().saturating_sub(1))
+                } else {
+                    occurrence_idx.min(candidates.len().saturating_sub(1))
+                };
+                candidates[candidate_idx]
+            }
+        } else if runtime_len == 1 {
+            0usize
+        } else {
+            step.idx.saturating_mul(max_art).saturating_div(runtime_len.saturating_sub(1))
+        };
+
+        mapping[step.idx] = mapped_idx.min(max_art);
+    }
+
+    for i in 1..mapping.len() {
+        if mapping[i] < mapping[i - 1] {
+            mapping[i] = mapping[i - 1];
+        }
+    }
+
+    mapping
+}
+
+fn opcode_overlap_ratio(runtime_ops: &[OpcodeStep], artifact_ops: &[OpcodeStep]) -> f64 {
+    if runtime_ops.is_empty() || artifact_ops.is_empty() {
+        return 0.0;
+    }
+
+    let mut runtime_counts: HashMap<u8, usize> = HashMap::new();
+    let mut artifact_counts: HashMap<u8, usize> = HashMap::new();
+    for step in runtime_ops {
+        *runtime_counts.entry(step.op).or_insert(0) += 1;
+    }
+    for step in artifact_ops {
+        *artifact_counts.entry(step.op).or_insert(0) += 1;
+    }
+
+    let overlap: usize = runtime_counts
+        .iter()
+        .map(|(op, count)| count.min(artifact_counts.get(op).unwrap_or(&0)))
+        .copied()
+        .sum();
+    overlap as f64 / runtime_ops.len() as f64
+}
+
+fn opcode_prefix_ratio(
+    runtime_ops: &[OpcodeStep],
+    artifact_ops: &[OpcodeStep],
+    limit: usize,
+) -> f64 {
+    let prefix_len = runtime_ops.len().min(artifact_ops.len()).min(limit);
+    if prefix_len == 0 {
+        return 0.0;
+    }
+    let mut matched = 0usize;
+    for idx in 0..prefix_len {
+        if runtime_ops[idx].op == artifact_ops[idx].op {
+            matched += 1;
+        }
+    }
+    matched as f64 / prefix_len as f64
+}
+
+fn opcode_similarity_score(runtime_ops: &[OpcodeStep], artifact_ops: &[OpcodeStep]) -> f64 {
+    if runtime_ops.is_empty() || artifact_ops.is_empty() {
+        return 0.0;
+    }
+
+    const SCORE_LCS_MAX_CELLS: usize = 8_000_000;
+    let lcs_cov = lcs_opcode_pairs(runtime_ops, artifact_ops, SCORE_LCS_MAX_CELLS)
+        .map(|pairs| pairs.len() as f64 / runtime_ops.len() as f64);
+    let overlap = opcode_overlap_ratio(runtime_ops, artifact_ops);
+    let prefix = opcode_prefix_ratio(runtime_ops, artifact_ops, 256);
+    let len_ratio = runtime_ops.len().min(artifact_ops.len()) as f64
+        / runtime_ops.len().max(artifact_ops.len()) as f64;
+    let heuristic_score = (0.65 * overlap) + (0.25 * prefix) + (0.10 * len_ratio);
+
+    match lcs_cov {
+        Some(lcs) => (0.7 * lcs) + (0.3 * heuristic_score),
+        None => heuristic_score,
+    }
+}
+
 /// Derive opcode PC -> line mappings for ALL contracts in the trace using artifact source maps.
-/// Stores a JSON object keyed by bytecode address with an array of {pc, line, file, jumpType} entries.
+/// Stores a JSON object keyed by bytecode address with an array of {pc, line?, file?, jumpType} entries.
 /// This handles Diamond proxies and DELEGATECALL patterns by processing each code_address.
 fn enrich_opcodes_with_lines(
     artifacts: &Value,
-    _snapshots: &Value,
+    snapshots: &Value,
     trace_inner: Option<&Value>,
 ) -> Option<Value> {
     // Gather ALL code addresses from the trace (not just the first one)
@@ -263,22 +698,48 @@ fn enrich_opcodes_with_lines(
         return None;
     }
 
-    info!("opcode mapping: found {} unique code addresses in trace: {:?}", all_addrs.len(), all_addrs);
+    info!(
+        "opcode mapping: found {} unique code addresses in trace: {:?}",
+        all_addrs.len(),
+        all_addrs
+    );
+
+    // Runtime bytecode seen in trace by code address.
+    let mut runtime_bytecodes: HashMap<String, String> = HashMap::new();
+    let mut trace_id_to_code_addr: HashMap<i64, String> = HashMap::new();
+    if let Some(inner) = trace_inner {
+        gather_runtime_bytecodes(inner, &mut runtime_bytecodes);
+        gather_trace_id_code_addresses(inner, &mut trace_id_to_code_addr);
+    }
+    let mut runtime_ops_by_addr: HashMap<String, Vec<OpcodeStep>> = HashMap::new();
+    for (runtime_addr, runtime_bytecode_hex) in &runtime_bytecodes {
+        if let Some(bytes) = decode_hex_bytecode(runtime_bytecode_hex) {
+            let runtime_ops = build_opcode_steps(&bytes);
+            if !runtime_ops.is_empty() {
+                runtime_ops_by_addr.insert(runtime_addr.clone(), runtime_ops);
+            }
+        }
+    }
+    let observed_opcode_steps_per_addr =
+        gather_observed_opcode_steps(snapshots, &trace_id_to_code_addr);
+    let observed_opcode_total: usize =
+        observed_opcode_steps_per_addr.values().map(|steps| steps.len()).sum();
+    info!(
+        "opcode mapping: observed {} opcode snapshots across {} addresses",
+        observed_opcode_total,
+        observed_opcode_steps_per_addr.len()
+    );
 
     let mut combined_map = Map::new();
 
     // Process each code address
     for addr in &all_addrs {
         // Get artifact for this address - try both exact match and case-insensitive
-        let artifact = artifacts.get(addr)
-            .or_else(|| {
-                // Try finding with case-insensitive match
-                artifacts.as_object().and_then(|obj| {
-                    obj.iter()
-                        .find(|(k, _)| k.to_lowercase() == *addr)
-                        .map(|(_, v)| v)
-                })
-            });
+        let artifact = artifacts.get(addr).or_else(|| {
+            artifacts
+                .as_object()
+                .and_then(|obj| obj.iter().find(|(k, _)| k.to_lowercase() == *addr).map(|(_, v)| v))
+        });
         let artifact = match artifact {
             Some(a) => a,
             None => {
@@ -299,16 +760,82 @@ fn enrich_opcodes_with_lines(
             }
         };
 
-        // PRIORITY 1: Use compilationTarget to find the exact contract
-        // This is critical for Diamond facets where multiple contracts are compiled together
-        // but only one is the actual deployed contract
+        // Collect all candidate contracts that have both deployed bytecode and source maps.
+        struct ContractCandidate<'a> {
+            file_path: &'a str,
+            contract_name: &'a str,
+            evm: &'a Value,
+            db_val_opt: Option<&'a Value>,
+            object_hex: String,
+            object_len: usize,
+            artifact_ops: Vec<OpcodeStep>,
+        }
+
+        let mut candidates: Vec<ContractCandidate> = Vec::new();
+        for (file_path, file_contracts) in contracts {
+            let Some(file_contracts_obj) = file_contracts.as_object() else {
+                continue;
+            };
+            for (candidate_name, contract) in file_contracts_obj {
+                let Some(evm) = contract.get("evm") else {
+                    continue;
+                };
+                let db_val_opt = evm.get("deployedBytecode");
+                let has_srcmap = evm
+                    .get("deployedSourceMap")
+                    .or_else(|| evm.get("deployed_source_map"))
+                    .or_else(|| {
+                        db_val_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map")))
+                    })
+                    .and_then(Value::as_str)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false);
+                if !has_srcmap {
+                    continue;
+                }
+
+                let object_hex = db_val_opt
+                    .and_then(|d| d.get("object").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .trim_start_matches("0x")
+                    .to_string();
+                if object_hex.is_empty() {
+                    continue;
+                }
+
+                let Some(artifact_bytes) = decode_hex_bytecode(&object_hex) else {
+                    continue;
+                };
+                let artifact_ops = build_opcode_steps(&artifact_bytes);
+                if artifact_ops.is_empty() {
+                    continue;
+                }
+
+                candidates.push(ContractCandidate {
+                    file_path: file_path.as_str(),
+                    contract_name: candidate_name.as_str(),
+                    evm,
+                    db_val_opt,
+                    object_len: object_hex.len(),
+                    object_hex,
+                    artifact_ops,
+                });
+            }
+        }
+
+        if candidates.is_empty() {
+            warn!("opcode mapping: no deployed source map found for {addr}");
+            continue;
+        }
+
+        // PRIORITY 1: Use compilationTarget to find the expected deployed contract
+        // from the compilation output, when available.
         let compilation_target = artifact
             .get("input")
             .and_then(|i| i.get("settings"))
             .and_then(|s| s.get("compilationTarget"))
             .and_then(Value::as_object)
             .or_else(|| {
-                // Try meta.Settings for Etherscan-like format
                 artifact
                     .get("meta")
                     .and_then(|m| m.get("Settings"))
@@ -316,141 +843,127 @@ fn enrich_opcodes_with_lines(
                     .and_then(Value::as_object)
             });
 
-        // Get meta.ContractName if present (Etherscan format)
-        let contract_name = artifact.get("meta")
-            .and_then(|m| m.get("ContractName"))
-            .and_then(Value::as_str);
+        // Get meta.ContractName if present (Etherscan format).
+        let meta_contract_name =
+            artifact.get("meta").and_then(|m| m.get("ContractName")).and_then(Value::as_str);
 
         debug!(
             "opcode mapping: {} compilationTarget={}, meta.ContractName={:?}",
             addr,
             compilation_target.is_some(),
-            contract_name
+            meta_contract_name
         );
 
-        let mut best: Option<(&Value, Option<&Value>, usize)> = None;
-        let mut best_len: usize = 0;
+        let mut heuristic_best_idx: Option<usize> = None;
+        let mut heuristic_reason = "largest-bytecode";
 
-        // Try to find the exact contract from compilationTarget first
+        // 1) Try exact match from compilationTarget.
         if let Some(ct) = compilation_target {
             for (file_path, contract_name) in ct {
                 if let Some(contract_name_str) = contract_name.as_str() {
-                    // Look for this exact contract in output.contracts
-                    if let Some(file_contracts) = contracts.get(file_path).and_then(Value::as_object) {
-                        if let Some(contract) = file_contracts.get(contract_name_str) {
-                            if let Some(evm) = contract.get("evm") {
-                                let db_val_opt = evm.get("deployedBytecode");
-                                let has_srcmap = evm
-                                    .get("deployedSourceMap")
-                                    .or_else(|| evm.get("deployed_source_map"))
-                                    .or_else(|| db_val_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map"))))
-                                    .and_then(Value::as_str)
-                                    .map(|s| !s.is_empty())
-                                    .unwrap_or(false);
-                                if has_srcmap {
-                                    let object_len = db_val_opt
-                                        .and_then(|d| d.get("object").and_then(Value::as_str))
-                                        .map(|s| s.len())
-                                        .unwrap_or(0);
-                                    debug!(
-                                        "opcode mapping: using compilationTarget {}:{} for {}",
-                                        file_path, contract_name_str, addr
-                                    );
-                                    best = Some((evm, db_val_opt, object_len));
-                                    best_len = object_len;
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    if let Some(idx) = candidates.iter().position(|candidate| {
+                        candidate.file_path == file_path
+                            && candidate.contract_name == contract_name_str
+                    }) {
+                        heuristic_best_idx = Some(idx);
+                        heuristic_reason = "compilationTarget";
+                        break;
+                    };
                 }
             }
         }
 
-        // PRIORITY 2: Use meta.ContractName (Etherscan format) to find the exact contract by name
-        // This is critical for Diamond facets where compilationTarget is not available
-        if best.is_none() {
-            if let Some(target_contract_name) = contract_name {
-                'outer: for (file_path, c) in contracts.iter() {
-                    if let Some(cobj) = c.as_object() {
-                        for (cname, contract) in cobj.iter() {
-                            if cname == target_contract_name {
-                                if let Some(evm) = contract.get("evm") {
-                                    let db_val_opt = evm.get("deployedBytecode");
-                                    let has_srcmap = evm
-                                        .get("deployedSourceMap")
-                                        .or_else(|| evm.get("deployed_source_map"))
-                                        .or_else(|| db_val_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map"))))
-                                        .and_then(Value::as_str)
-                                        .map(|s| !s.is_empty())
-                                        .unwrap_or(false);
-                                    if has_srcmap {
-                                        let object_len = db_val_opt
-                                            .and_then(|d| d.get("object").and_then(Value::as_str))
-                                            .map(|s| s.len())
-                                            .unwrap_or(0);
-                                        debug!(
-                                            "opcode mapping: using meta.ContractName match {}:{} for {}",
-                                            file_path, target_contract_name, addr
-                                        );
-                                        best = Some((evm, db_val_opt, object_len));
-                                        best_len = object_len;
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if best.is_none() {
-                    debug!("opcode mapping: {} contract '{}' not found or has no source map", addr, target_contract_name);
+        // 2) Fall back to meta.ContractName exact contract-name matching.
+        if heuristic_best_idx.is_none() {
+            if let Some(target_contract_name) = meta_contract_name {
+                if let Some(idx) = candidates
+                    .iter()
+                    .position(|candidate| candidate.contract_name == target_contract_name)
+                {
+                    heuristic_best_idx = Some(idx);
+                    heuristic_reason = "meta.ContractName";
+                } else {
+                    debug!(
+                        "opcode mapping: {} contract '{}' not found or has no source map",
+                        addr, target_contract_name
+                    );
                 }
             }
         }
 
-        // PRIORITY 3: Fallback to largest bytecode with source map (original heuristic)
-        if best.is_none() {
-            debug!("opcode mapping: {} falling back to largest bytecode heuristic", addr);
-            for c in contracts.values() {
-                if let Some(cobj) = c.as_object() {
-                    for contract in cobj.values() {
-                        let evm = match contract.get("evm") {
-                            Some(e) => e,
-                            None => continue,
-                        };
-                        let db_val_opt = evm.get("deployedBytecode");
-                        let object_len = db_val_opt
-                            .and_then(|d| d.get("object").and_then(Value::as_str))
-                            .map(|s| s.len())
-                            .unwrap_or(0);
-                        let candidate_nonempty = evm
-                            .get("deployedSourceMap")
-                            .or_else(|| evm.get("deployed_source_map"))
-                            .or_else(|| db_val_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map"))))
-                            .and_then(Value::as_str)
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false);
-                        if candidate_nonempty && object_len > best_len {
-                            best_len = object_len;
-                            best = Some((evm, db_val_opt, object_len));
-                        }
-                    }
+        // 3) Last-resort fallback: largest deployed bytecode among candidates.
+        if heuristic_best_idx.is_none() {
+            heuristic_best_idx =
+                candidates.iter().enumerate().max_by_key(|(_, c)| c.object_len).map(|(idx, _)| idx);
+            heuristic_reason = "largest-bytecode";
+        }
+
+        let heuristic_idx = heuristic_best_idx.unwrap_or(0);
+        let mut selected_idx = heuristic_idx;
+        let mut selection_reason = heuristic_reason;
+
+        // Runtime-bytecode match guardrail: if heuristics disagree with actual execution bytecode,
+        // prefer the candidate whose opcode stream best matches the runtime stream.
+        if let Some(runtime_ops) = runtime_ops_by_addr.get(addr) {
+            let mut best_runtime_idx: Option<usize> = None;
+            let mut best_runtime_score = 0.0f64;
+            let mut similarity_scores = vec![0.0f64; candidates.len()];
+
+            for (idx, candidate) in candidates.iter().enumerate() {
+                let score = opcode_similarity_score(runtime_ops, &candidate.artifact_ops);
+                similarity_scores[idx] = score;
+                if best_runtime_idx.is_none() || score > best_runtime_score {
+                    best_runtime_idx = Some(idx);
+                    best_runtime_score = score;
                 }
+            }
+
+            if let Some(runtime_idx) = best_runtime_idx {
+                let heuristic_score = similarity_scores[heuristic_idx];
+                const MIN_OVERRIDE_SCORE: f64 = 0.32;
+                const MIN_OVERRIDE_MARGIN: f64 = 0.06;
+                if runtime_idx != heuristic_idx
+                    && best_runtime_score >= MIN_OVERRIDE_SCORE
+                    && (best_runtime_score > heuristic_score + MIN_OVERRIDE_MARGIN
+                        || heuristic_score < (MIN_OVERRIDE_SCORE * 0.5))
+                {
+                    selection_reason = "runtime-bytecode-match";
+                    selected_idx = runtime_idx;
+                }
+
+                debug!(
+                    "opcode mapping: {} candidate select heuristic={}({:.3}) runtime={}({:.3}) final={} reason={}",
+                    addr,
+                    heuristic_idx,
+                    heuristic_score,
+                    runtime_idx,
+                    best_runtime_score,
+                    selected_idx,
+                    selection_reason
+                );
             }
         }
 
-        let (evm_best, db_best_opt, _) = match best {
-            Some(t) => t,
-            _ => {
-                warn!("opcode mapping: no deployed source map found for {addr}");
-                continue;
-            }
-        };
+        let selected = &candidates[selected_idx];
+        let evm_best = selected.evm;
+        let db_best_opt = selected.db_val_opt;
+        let artifact_bytecode_hex = selected.object_hex.clone();
+        let artifact_op_list = selected.artifact_ops.clone();
+        info!(
+            "opcode mapping: {} selected contract {}:{} via {} (artifact opcodes={})",
+            addr,
+            selected.file_path,
+            selected.contract_name,
+            selection_reason,
+            artifact_op_list.len()
+        );
 
         let deployed_srcmap = match evm_best
             .get("deployedSourceMap")
             .or_else(|| evm_best.get("deployed_source_map"))
-            .or_else(|| db_best_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map"))))
+            .or_else(|| {
+                db_best_opt.and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map")))
+            })
             .and_then(Value::as_str)
         {
             Some(sm) if !sm.is_empty() => sm,
@@ -460,48 +973,29 @@ fn enrich_opcodes_with_lines(
             }
         };
 
-        let bytecode_hex = db_best_opt
-            .and_then(|d| d.get("object").and_then(Value::as_str))
-            .unwrap_or_default()
-            .trim_start_matches("0x")
-            .to_string();
-        if bytecode_hex.is_empty() {
-            debug!("opcode mapping: no deployed bytecode object for {addr}");
-            continue;
-        }
-
         info!(
-            "opcode mapping: processing {} (source map entries: {}, bytecode len: {})",
+            "opcode mapping: processing {} (source map entries: {}, artifact bytecode len: {}, artifact opcodes: {})",
             addr,
             deployed_srcmap.split(';').count(),
-            bytecode_hex.len()
+            artifact_bytecode_hex.len(),
+            artifact_op_list.len()
         );
 
-        let input_sources_obj = match artifact
-            .get("input")
-            .and_then(|i| i.get("sources"))
-            .and_then(Value::as_object)
-        {
-            Some(s) => s,
-            None => {
-                debug!("opcode mapping: no sources found in artifact for {addr}");
-                continue;
-            }
-        };
+        let input_sources_obj =
+            match artifact.get("input").and_then(|i| i.get("sources")).and_then(Value::as_object) {
+                Some(s) => s,
+                None => {
+                    debug!("opcode mapping: no sources found in artifact for {addr}");
+                    continue;
+                }
+            };
 
-        // Get output.sources to find the correct file ordering via 'id' field
-        // The source map's file index refers to this ordering
-        let output_sources_obj = artifact
-            .get("output")
-            .and_then(|o| o.get("sources"))
-            .and_then(Value::as_object);
+        let output_sources_obj =
+            artifact.get("output").and_then(|o| o.get("sources")).and_then(Value::as_object);
 
-        // Build ordered source vector to resolve file idx
-        // CRITICAL: Use output.sources.id for correct ordering, then map to input.sources content
+        // Build source vector preserving output.sources id indexing.
         let mut source_vec: Vec<(String, String)> = Vec::new();
-
         if let Some(output_sources) = output_sources_obj {
-            // Build a list of (id, path) pairs and sort by id
             let mut ordered_sources: Vec<(usize, String)> = Vec::new();
             for (path, info) in output_sources {
                 if let Some(id) = info.get("id").and_then(Value::as_u64) {
@@ -510,24 +1004,55 @@ fn enrich_opcodes_with_lines(
             }
             ordered_sources.sort_by_key(|(id, _)| *id);
 
-            // Now map to input.sources content in the correct order
-            for (_, path) in ordered_sources {
-                if let Some(content) = input_sources_obj
-                    .get(&path)
-                    .and_then(|v| v.get("content").and_then(Value::as_str))
-                {
-                    source_vec.push((path, content.to_string()));
+            if let Some(max_id) = ordered_sources.iter().map(|(id, _)| *id).max() {
+                let mut indexed_sources: Vec<(String, String)> = (0..=max_id)
+                    .map(|id| (format!("__unknown_source_{id}__"), String::new()))
+                    .collect();
+
+                for (id, path) in ordered_sources {
+                    let mut content = input_sources_obj
+                        .get(&path)
+                        .and_then(|v| v.get("content").and_then(Value::as_str))
+                        .map(str::to_string);
+
+                    if content.is_none() {
+                        let filename = path.rsplit('/').next().unwrap_or(path.as_str());
+                        for (src_path, src_val) in input_sources_obj {
+                            if src_path.ends_with(filename) {
+                                content = src_val
+                                    .get("content")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                if content.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    indexed_sources[id] = (path, content.unwrap_or_default());
                 }
+
+                source_vec = indexed_sources;
+                debug!(
+                    "opcode mapping: using output.sources ordering for {} ({} indexed files)",
+                    addr,
+                    source_vec.len()
+                );
             }
-            debug!("opcode mapping: using output.sources ordering for {addr} ({} files)", source_vec.len());
-        } else {
-            // Fallback: iterate input.sources directly (order not guaranteed)
+        }
+
+        if source_vec.is_empty() {
+            // Fallback: iterate input.sources directly (order is not guaranteed).
             for (path, val) in input_sources_obj {
                 if let Some(content) = val.get("content").and_then(Value::as_str) {
                     source_vec.push((path.clone(), content.to_string()));
                 }
             }
-            debug!("opcode mapping: using input.sources fallback for {addr} ({} files)", source_vec.len());
+            debug!(
+                "opcode mapping: using input.sources fallback for {addr} ({} files)",
+                source_vec.len()
+            );
         }
 
         if source_vec.is_empty() {
@@ -535,24 +1060,259 @@ fn enrich_opcodes_with_lines(
             continue;
         }
 
-        // Build op_idx -> pc mapping in order
-        let bytes = match hex::decode(&bytecode_hex) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("opcode mapping: failed to decode bytecode for {addr}: {e:?}");
+        // Build source map info per ARTIFACT opcode index.
+        #[derive(Clone)]
+        struct SourceMapEntry {
+            file: Option<String>,
+            line: Option<usize>,
+            jump_type: String,
+        }
+
+        let map_entries: Vec<&str> = deployed_srcmap.split(';').collect();
+        let mut source_by_artifact_idx: Vec<SourceMapEntry> =
+            Vec::with_capacity(artifact_op_list.len());
+
+        let mut last_offset = "0".to_string();
+        let mut last_file = "-1".to_string();
+        let mut last_jump = String::new();
+
+        for artifact_step in &artifact_op_list {
+            let segment = map_entries.get(artifact_step.idx).copied().unwrap_or("");
+            if !segment.is_empty() {
+                let parts: Vec<&str> = segment.split(':').collect();
+                if let Some(p) = parts.first().copied().filter(|s| !s.is_empty()) {
+                    last_offset = p.to_string();
+                }
+                if let Some(p) = parts.get(2).copied().filter(|s| !s.is_empty()) {
+                    last_file = p.to_string();
+                }
+                if let Some(p) = parts.get(3).copied().filter(|s| !s.is_empty()) {
+                    last_jump = p.to_string();
+                }
+            }
+
+            let jump_type = match last_jump.as_str() {
+                "i" | "o" | "-" => last_jump.clone(),
+                _ => String::new(),
+            };
+
+            let file_idx: isize = last_file.parse().unwrap_or(-1);
+            if file_idx < 0 || file_idx as usize >= source_vec.len() {
+                source_by_artifact_idx.push(SourceMapEntry { file: None, line: None, jump_type });
                 continue;
             }
-        };
-        let mut op_list = Vec::new();
-        let mut pc = 0usize;
-        let mut idx = 0usize;
-        while pc < bytes.len() {
-            let op = bytes[pc];
-            op_list.push((idx, pc, op));
-            let push_len = if (0x60..=0x7f).contains(&op) { (op - 0x5f) as usize } else { 0 };
-            pc += 1 + push_len;
-            idx += 1;
+
+            let offset: usize = last_offset.parse().unwrap_or(0);
+            let (path, content) = &source_vec[file_idx as usize];
+            let line = if content.is_empty() {
+                None
+            } else {
+                let mut acc = 0usize;
+                let mut line_no = 1usize;
+                for (idx, ln) in content.split('\n').enumerate() {
+                    acc += ln.len() + 1;
+                    if acc > offset {
+                        line_no = idx + 1;
+                        break;
+                    }
+                    line_no = idx + 1;
+                }
+                Some(line_no)
+            };
+
+            source_by_artifact_idx.push(SourceMapEntry {
+                file: Some(path.clone()),
+                line,
+                jump_type,
+            });
         }
+
+        // Runtime opcode list from trace bytecode for this address.
+        let runtime_op_list =
+            runtime_ops_by_addr.get(addr).cloned().unwrap_or_else(|| artifact_op_list.clone());
+
+        let mut runtime_pc_to_idx: HashMap<usize, usize> = HashMap::new();
+        for step in &runtime_op_list {
+            runtime_pc_to_idx.entry(step.pc).or_insert(step.idx);
+        }
+
+        let nearest_runtime_idx_for_pc = |pc: usize| {
+            runtime_op_list
+                .iter()
+                .min_by_key(|step| step.pc.abs_diff(pc))
+                .map(|step| step.idx)
+                .unwrap_or(0usize)
+        };
+
+        let mut runtime_steps_to_map: Vec<(usize, u8, usize)> = Vec::new();
+        let observed_steps_count =
+            observed_opcode_steps_per_addr.get(addr).map(|steps| steps.len()).unwrap_or(0);
+        if let Some(observed_steps) = observed_opcode_steps_per_addr.get(addr) {
+            let mut seen_pcs: HashSet<usize> = HashSet::new();
+            for observed in observed_steps {
+                if !seen_pcs.insert(observed.pc) {
+                    continue;
+                }
+                let runtime_idx = runtime_pc_to_idx
+                    .get(&observed.pc)
+                    .copied()
+                    .unwrap_or_else(|| nearest_runtime_idx_for_pc(observed.pc));
+                runtime_steps_to_map.push((observed.pc, observed.op, runtime_idx));
+            }
+        }
+        if runtime_steps_to_map.is_empty() {
+            for step in &runtime_op_list {
+                runtime_steps_to_map.push((step.pc, step.op, step.idx));
+            }
+        }
+        debug!(
+            "opcode mapping: {} observed_steps={}, runtime_steps_to_map={}",
+            addr,
+            observed_steps_count,
+            runtime_steps_to_map.len()
+        );
+
+        // Align runtime op indices to artifact op indices so source maps can survive bytecode differences.
+        let runtime_to_artifact_idx = if runtime_op_list.len() == artifact_op_list.len()
+            && runtime_op_list.iter().zip(artifact_op_list.iter()).all(|(a, b)| a.op == b.op)
+        {
+            (0..runtime_op_list.len()).collect::<Vec<_>>()
+        } else {
+            let min_len = runtime_op_list.len().min(artifact_op_list.len());
+            let max_len = runtime_op_list.len().max(artifact_op_list.len());
+            let len_ratio = if max_len == 0 { 0.0 } else { min_len as f64 / max_len as f64 };
+            let mut same_at_index = 0usize;
+            let mut prefix_matches = 0usize;
+            let mut prefix_broken = false;
+            for idx in 0..min_len {
+                if runtime_op_list[idx].op == artifact_op_list[idx].op {
+                    same_at_index += 1;
+                    if !prefix_broken {
+                        prefix_matches += 1;
+                    }
+                } else {
+                    prefix_broken = true;
+                }
+            }
+            let same_ratio = if min_len == 0 { 0.0 } else { same_at_index as f64 / min_len as f64 };
+            let prefix_ratio =
+                if min_len == 0 { 0.0 } else { prefix_matches as f64 / min_len as f64 };
+
+            // Fast path for near-identical opcode streams (common when runtime bytecode is not
+            // instrumented): direct index mapping avoids coarse observed-LCS interpolation drift.
+            let use_near_identity =
+                len_ratio >= 0.95 && (same_ratio >= 0.98 || prefix_ratio >= 0.95);
+            if use_near_identity {
+                let max_art_idx = artifact_op_list.len().saturating_sub(1);
+                let mapping =
+                    (0..runtime_op_list.len()).map(|idx| idx.min(max_art_idx)).collect::<Vec<_>>();
+                info!(
+                    "opcode mapping: {} runtime/artifact near-identity alignment len_ratio={:.3} same_ratio={:.3} prefix_ratio={:.3}",
+                    addr, len_ratio, same_ratio, prefix_ratio
+                );
+                mapping
+            } else {
+                const FULL_LCS_MAX_CELLS: usize = 16_000_000;
+                let full_lcs =
+                    lcs_opcode_pairs(&runtime_op_list, &artifact_op_list, FULL_LCS_MAX_CELLS);
+                let full_anchors = full_lcs.clone().unwrap_or_default();
+
+                // Build a reduced runtime sequence from observed opcode snapshots to keep alignment robust
+                // for very large runtime bytecode (e.g. revert traces with huge facets/proxies).
+                let mut observed_runtime_steps: Vec<(usize, u8)> = Vec::new();
+                let mut seen_runtime_idx: HashSet<usize> = HashSet::new();
+                for (_, op, runtime_idx) in &runtime_steps_to_map {
+                    if seen_runtime_idx.insert(*runtime_idx) {
+                        observed_runtime_steps.push((*runtime_idx, *op));
+                    }
+                }
+                observed_runtime_steps.sort_by_key(|(runtime_idx, _)| *runtime_idx);
+
+                let observed_runtime_ops: Vec<OpcodeStep> = observed_runtime_steps
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, (runtime_idx, op))| OpcodeStep { idx, pc: *runtime_idx, op: *op })
+                    .collect();
+
+                let observed_anchor_pairs = if observed_runtime_ops.is_empty() {
+                    Vec::new()
+                } else {
+                    let observed_lcs = lcs_opcode_pairs(
+                        &observed_runtime_ops,
+                        &artifact_op_list,
+                        FULL_LCS_MAX_CELLS,
+                    )
+                    .unwrap_or_default();
+                    observed_lcs
+                        .into_iter()
+                        .map(|(observed_idx, artifact_idx)| {
+                            (observed_runtime_ops[observed_idx].pc, artifact_idx)
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                let full_runtime_cov = if runtime_op_list.is_empty() {
+                    0.0
+                } else {
+                    full_anchors.len() as f64 / runtime_op_list.len() as f64
+                };
+                let observed_runtime_cov = if runtime_op_list.is_empty() {
+                    0.0
+                } else {
+                    observed_anchor_pairs.len() as f64 / runtime_op_list.len() as f64
+                };
+
+                let use_observed_alignment = full_lcs.is_none()
+                    || (full_anchors.is_empty() && !observed_anchor_pairs.is_empty())
+                    || (full_runtime_cov < 0.05 && observed_runtime_cov > full_runtime_cov);
+
+                let (alignment_mode, chosen_anchors): (&str, Vec<(usize, usize)>) =
+                    if use_observed_alignment {
+                        ("observed-lcs", observed_anchor_pairs)
+                    } else {
+                        ("full-lcs", full_anchors)
+                    };
+
+                let mapping = if chosen_anchors.is_empty() {
+                    warn!(
+                        "opcode mapping: {} alignment mode={} produced 0 anchors; falling back to opcode-occurrence mapping (runtime_ops={}, artifact_ops={})",
+                        addr,
+                        alignment_mode,
+                        runtime_op_list.len(),
+                        artifact_op_list.len()
+                    );
+                    build_runtime_to_artifact_map_by_opcode(&runtime_op_list, &artifact_op_list)
+                } else {
+                    build_runtime_to_artifact_map(
+                        runtime_op_list.len(),
+                        artifact_op_list.len(),
+                        &chosen_anchors,
+                    )
+                };
+
+                let runtime_cov = if runtime_op_list.is_empty() {
+                    0.0
+                } else {
+                    (chosen_anchors.len() as f64 / runtime_op_list.len() as f64) * 100.0
+                };
+                let artifact_cov = if artifact_op_list.is_empty() {
+                    0.0
+                } else {
+                    (chosen_anchors.len() as f64 / artifact_op_list.len() as f64) * 100.0
+                };
+                info!(
+                    "opcode mapping: {} runtime/artifact alignment mode={} anchors={} runtime_ops={} artifact_ops={} (runtime_cov={:.1}%, artifact_cov={:.1}%)",
+                    addr,
+                    alignment_mode,
+                    chosen_anchors.len(),
+                    runtime_op_list.len(),
+                    artifact_op_list.len(),
+                    runtime_cov,
+                    artifact_cov
+                );
+                mapping
+            }
+        };
 
         let is_important = |op: u8| {
             matches!(
@@ -561,7 +1321,8 @@ fn enrich_opcodes_with_lines(
                     | 0x55 // SSTORE
                     | 0x56 // JUMP
                     | 0x57 // JUMPI
-                    | 0xa0..=0xa4 // LOG0-LOG4
+                    | 0xa0
+                    ..=0xa4 // LOG0-LOG4
                     | 0xf0 // CREATE
                     | 0xf1 // CALL
                     | 0xf2 // CALLCODE
@@ -574,70 +1335,177 @@ fn enrich_opcodes_with_lines(
             )
         };
 
-        // Parse deployed source map
-        let mut pc_line_map_full = Vec::new();
-        let mut pc_line_map_filtered = Vec::new();
-        let mut last = ("0", "0", "-1", "");
-        let mut last_line_cache: Option<(String, usize)> = None;
-        let map_entries: Vec<&str> = deployed_srcmap.split(';').collect();
+        let should_fallback_opcode_source = |op: u8| {
+            matches!(
+                op,
+                0x54 // SLOAD
+                    | 0x55 // SSTORE
+                    | 0x56 // JUMP
+                    | 0x57 // JUMPI
+                    | 0xa0
+                    ..=0xa4 // LOG0-LOG4
+                    | 0xf0 // CREATE
+                    | 0xf1 // CALL
+                    | 0xf2 // CALLCODE
+                    | 0xf3 // RETURN
+                    | 0xf4 // DELEGATECALL
+                    | 0xf5 // CREATE2
+                    | 0xfa // STATICCALL
+                    | 0xfd // REVERT
+                    | 0xff // SELFDESTRUCT
+            )
+        };
+        let is_generated_source = |file: &str| file.starts_with('#') || file.ends_with(".yul");
 
-        for (op_idx, pc, op_byte) in op_list {
-            let segment = map_entries.get(op_idx).copied().unwrap_or("");
-            if !segment.is_empty() {
-                let parts: Vec<&str> = segment.split(':').collect();
-                let offset_part = parts
-                    .get(0)
-                    .copied()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(last.0);
-                let length_part = parts
-                    .get(1)
-                    .copied()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(last.1);
-                let file_part = parts
-                    .get(2)
-                    .copied()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(last.2);
-                let jump_part = parts
-                    .get(3)
-                    .copied()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(last.3);
-                last = (offset_part, length_part, file_part, jump_part);
-            }
-            let file_idx: isize = last.2.parse().unwrap_or(-1);
-            let resolved = if file_idx < 0 || file_idx as usize >= source_vec.len() {
-                last_line_cache.clone()
-            } else {
-                let offset: usize = last.0.parse().unwrap_or(0);
-                let (path, content) = &source_vec[file_idx as usize];
-                let mut acc = 0usize;
-                let mut line = 1usize;
-                for (idx, ln) in content.split('\n').enumerate() {
-                    acc += ln.len() + 1;
-                    if acc > offset {
-                        line = idx + 1;
-                        break;
+        #[derive(Clone)]
+        struct OpcodeSourceFallback {
+            file: String,
+            line: usize,
+        }
+
+        let mut runtime_opcode_totals: HashMap<u8, usize> = HashMap::new();
+        for (_, op, _) in &runtime_steps_to_map {
+            *runtime_opcode_totals.entry(*op).or_insert(0) += 1;
+        }
+
+        let mut opcode_source_any: HashMap<u8, Vec<OpcodeSourceFallback>> = HashMap::new();
+        let mut opcode_source_nongen: HashMap<u8, Vec<OpcodeSourceFallback>> = HashMap::new();
+        for artifact_step in &artifact_op_list {
+            if let Some(src) = source_by_artifact_idx.get(artifact_step.idx) {
+                if let (Some(file), Some(line)) = (&src.file, src.line) {
+                    let candidate = OpcodeSourceFallback { file: file.clone(), line };
+                    opcode_source_any.entry(artifact_step.op).or_default().push(candidate.clone());
+                    if !is_generated_source(file) {
+                        opcode_source_nongen.entry(artifact_step.op).or_default().push(candidate);
                     }
-                    line = idx + 1;
-                }
-                Some((path.clone(), line))
-            };
-            if let Some((path, line)) = resolved {
-                last_line_cache = Some((path.clone(), line));
-                let jump_type = last.3;
-                pc_line_map_full.push(json!({"pc": pc, "line": line, "file": path, "jumpType": jump_type}));
-                if is_important(op_byte) {
-                    pc_line_map_filtered.push(json!({"pc": pc, "line": line, "file": path, "jumpType": jump_type}));
                 }
             }
         }
 
+        let nearest_source_for_artifact_idx = |idx: usize| -> Option<OpcodeSourceFallback> {
+            if source_by_artifact_idx.is_empty() {
+                return None;
+            }
+            let max_radius = source_by_artifact_idx.len();
+            for radius in 0..max_radius {
+                let left_idx = idx.checked_sub(radius);
+                if let Some(li) = left_idx {
+                    if let Some(src) = source_by_artifact_idx.get(li) {
+                        if let (Some(file), Some(line)) = (&src.file, src.line) {
+                            if !is_generated_source(file) {
+                                return Some(OpcodeSourceFallback { file: file.clone(), line });
+                            }
+                        }
+                    }
+                }
+                let right_idx = idx + radius;
+                if right_idx < source_by_artifact_idx.len() {
+                    if let Some(src) = source_by_artifact_idx.get(right_idx) {
+                        if let (Some(file), Some(line)) = (&src.file, src.line) {
+                            if !is_generated_source(file) {
+                                return Some(OpcodeSourceFallback { file: file.clone(), line });
+                            }
+                        }
+                    }
+                }
+            }
+
+            for radius in 0..max_radius {
+                let left_idx = idx.checked_sub(radius);
+                if let Some(li) = left_idx {
+                    if let Some(src) = source_by_artifact_idx.get(li) {
+                        if let (Some(file), Some(line)) = (&src.file, src.line) {
+                            return Some(OpcodeSourceFallback { file: file.clone(), line });
+                        }
+                    }
+                }
+                let right_idx = idx + radius;
+                if right_idx < source_by_artifact_idx.len() {
+                    if let Some(src) = source_by_artifact_idx.get(right_idx) {
+                        if let (Some(file), Some(line)) = (&src.file, src.line) {
+                            return Some(OpcodeSourceFallback { file: file.clone(), line });
+                        }
+                    }
+                }
+            }
+
+            None
+        };
+
+        let mut pc_line_map_full = Vec::new();
+        let mut pc_line_map_filtered = Vec::new();
+        let mut runtime_opcode_seen: HashMap<u8, usize> = HashMap::new();
+
+        for (pc, op, runtime_idx) in &runtime_steps_to_map {
+            let occurrence_idx = *runtime_opcode_seen.get(op).unwrap_or(&0);
+            runtime_opcode_seen.insert(*op, occurrence_idx + 1);
+
+            let mapped_art_idx =
+                runtime_to_artifact_idx.get(*runtime_idx).copied().unwrap_or_else(|| {
+                    (*runtime_idx).min(source_by_artifact_idx.len().saturating_sub(1))
+                });
+            let src = match source_by_artifact_idx.get(mapped_art_idx) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let mut resolved_file = src.file.clone();
+            let mut resolved_line = src.line;
+
+            if should_fallback_opcode_source(*op)
+                && (resolved_file.is_none() || resolved_line.is_none())
+            {
+                let fallback_candidates = opcode_source_nongen
+                    .get(op)
+                    .filter(|entries| !entries.is_empty())
+                    .or_else(|| opcode_source_any.get(op).filter(|entries| !entries.is_empty()));
+                if let Some(candidates) = fallback_candidates {
+                    let runtime_total = *runtime_opcode_totals.get(op).unwrap_or(&1);
+                    let candidate_idx = if runtime_total > 1 && candidates.len() > 1 {
+                        let numerator = occurrence_idx.saturating_mul(candidates.len() - 1);
+                        let denominator = runtime_total - 1;
+                        ((numerator + (denominator / 2)) / denominator).min(candidates.len() - 1)
+                    } else {
+                        occurrence_idx.min(candidates.len() - 1)
+                    };
+                    if let Some(fallback) = candidates.get(candidate_idx) {
+                        resolved_file = Some(fallback.file.clone());
+                        resolved_line = Some(fallback.line);
+                    }
+                }
+            }
+
+            if resolved_file.is_none() || resolved_line.is_none() {
+                if let Some(fallback) = nearest_source_for_artifact_idx(mapped_art_idx) {
+                    resolved_file = Some(fallback.file);
+                    resolved_line = Some(fallback.line);
+                }
+            }
+
+            let mut row = Map::new();
+            row.insert("pc".into(), json!(*pc));
+            if let Some(line) = resolved_line {
+                row.insert("line".into(), json!(line));
+            }
+            if let Some(file) = &resolved_file {
+                row.insert("file".into(), Value::String(file.clone()));
+            }
+            row.insert("jumpType".into(), Value::String(src.jump_type.clone()));
+
+            let row_value = Value::Object(row);
+            pc_line_map_full.push(row_value.clone());
+            if is_important(*op) {
+                pc_line_map_filtered.push(row_value);
+            }
+        }
+
         if !pc_line_map_full.is_empty() {
-            info!("opcode mapping: {} has {} full entries, {} filtered entries",
-                  addr, pc_line_map_full.len(), pc_line_map_filtered.len());
+            info!(
+                "opcode mapping: {} has {} full entries, {} filtered entries",
+                addr,
+                pc_line_map_full.len(),
+                pc_line_map_filtered.len()
+            );
             combined_map.insert(addr.clone(), Value::Array(pc_line_map_full));
             combined_map.insert(format!("{addr}_filtered"), Value::Array(pc_line_map_filtered));
         }
@@ -682,7 +1550,10 @@ async fn run(keep_alive: bool) -> Result<(), SimulatorError> {
     Ok(())
 }
 
-async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(SimulationResult, Option<Engine>), SimulatorError> {
+async fn simulate_onchain(
+    job: &SimulationJob,
+    keep_alive: bool,
+) -> Result<(SimulationResult, Option<Engine>), SimulatorError> {
     let simulation_start = std::time::Instant::now();
     info!("[TIMING] simulate_onchain START");
 
@@ -694,6 +1565,7 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
         TxHash::from_str(tx_hash_str).map_err(|e| SimulatorError::Simulation(e.to_string()))?;
 
     let quick_mode = job.analysis_options.quick_mode;
+    let precompute_hook_states = env_flag("EDB_PRECOMPUTE_HOOK_STATES", false);
 
     let fork_start = std::time::Instant::now();
     let fork_result = fork_and_prepare(&job.rpc_url, tx_hash, quick_mode)
@@ -705,7 +1577,17 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
 
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(quick_mode)
-        .with_precompute_state_variables(keep_alive)
+        .with_precompute_state_variables(
+            precompute_hook_states
+                && keep_alive
+                && !job.debug_session_only
+                && !job.analysis_options.quick_mode,
+        )
+        .with_collect_hook_snapshots(keep_alive && job.analysis_options.collect_snapshots)
+        // Trace parity mode: retain full opcode snapshots for rendered trace rows
+        // even in non-keep-alive simulations (reference-aligned gas/stack fidelity).
+        .with_significant_opcode_snapshots_only(false)
+        .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
         engine_config = engine_config.with_etherscan_api_key(key.clone());
@@ -724,9 +1606,20 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
         info!("Preloading {} FE-compiled artifacts into engine", preloaded.len());
     }
 
+    // Create progress channel to stream preparation stages to stderr as JSON lines.
+    // The bridge parses lines prefixed with __EDB_PROGRESS__ to forward via SSE.
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<edb_common::ProgressMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = progress_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                eprintln!("__EDB_PROGRESS__:{json}");
+            }
+        }
+    });
+
     let prepare_start = std::time::Instant::now();
     let rpc_addr = engine
-        .prepare(fork_result, None, preloaded_artifacts)
+        .prepare(fork_result, Some(progress_tx), preloaded_artifacts)
         .await
         .map_err(|e| SimulatorError::Engine(format!("engine preparation failed: {e:?}")))?;
     info!("[TIMING] engine.prepare(): {:.2}s", prepare_start.elapsed().as_secs_f64());
@@ -736,6 +1629,30 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
     let client = Client::new();
     let main_client = Client::new();
 
+    // Fast path for bridge /debug/start fallback:
+    // create a keep-alive debug session without exporting heavy trace payloads.
+    if keep_alive && job.debug_session_only {
+        let snapshot_count: u64 =
+            call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([])).await.unwrap_or(0);
+        let debug_session =
+            Some(DebugSession { rpc_url: rpc_url.clone(), rpc_port, snapshot_count });
+        let result = SimulationResult {
+            mode: SimulationMode::Onchain,
+            success: true,
+            error: None,
+            warnings: vec!["debugSessionOnly mode enabled: trace payload omitted".to_string()],
+            revert_reason: None,
+            gas_used: None,
+            gas_limit_suggested,
+            raw_trace: None,
+            rendered_trace: None,
+            debug_session,
+            debug_level: Some(DebugLevel::SourceInstrumented),
+        };
+        info!("debugSessionOnly keep-alive session created at {}", rpc_url);
+        return Ok((result, Some(engine)));
+    }
+
     let result = async {
         let trace_start = std::time::Instant::now();
         let trace_value: Value = call_edb_rpc(&client, &rpc_url, "edb_getTrace", json!([])).await?;
@@ -744,8 +1661,27 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
         let gas_used = fetch_receipt_gas_used(&main_client, &job.rpc_url, tx_hash_str).await.ok();
         let (success, revert_reason) = analyze_trace(&trace_value);
 
+        // Fetch rendered trace (fully decoded rows from Rust engine)
+        let render_start = std::time::Instant::now();
+        let rendered_trace: Option<Value> =
+            match call_edb_rpc(&client, &rpc_url, "edb_getRenderedTrace", json!([])).await {
+                Ok(v) => {
+                    info!(
+                        "[TIMING] edb_getRenderedTrace RPC call: {:.2}s",
+                        render_start.elapsed().as_secs_f64()
+                    );
+                    Some(v)
+                }
+                Err(e) => {
+                    warn!("edb_getRenderedTrace failed (falling back to FE decode): {e}");
+                    None
+                }
+            };
+
         let enrich_start = std::time::Instant::now();
-        // When keep_alive is enabled, use lazy snapshots - frontend will fetch on-demand via RPC
+        // When rendered trace is available and we're not in keep-alive debug mode,
+        // skip heavy rawTrace enrichment fields (snapshots/sources/opcode mapping)
+        // because FE V3 consumes renderedTrace directly.
         let mut enriched_trace = enrich_trace_payload(
             &client,
             &rpc_url,
@@ -753,8 +1689,12 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
             trace_value,
             provided_artifacts.as_ref(),
             keep_alive, // lazy_snapshots = true when keep_alive is enabled
+            rendered_trace.is_some() && !keep_alive,
         )
         .await;
+        if let Some(ref rendered) = rendered_trace {
+            backfill_storage_diffs_from_rendered_trace(&mut enriched_trace, rendered);
+        }
         info!("[TIMING] enrich_trace_payload: {:.2}s", enrich_start.elapsed().as_secs_f64());
 
         if let Some(g) = gas_used {
@@ -766,14 +1706,11 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
         // Include debug session info when keep_alive is enabled
         let debug_session = if keep_alive {
             // Fetch snapshot count for debug session
-            let snapshot_count: u64 = call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([]))
-                .await
-                .unwrap_or(0);
-            Some(DebugSession {
-                rpc_url: rpc_url.clone(),
-                rpc_port,
-                snapshot_count,
-            })
+            let snapshot_count: u64 =
+                call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([]))
+                    .await
+                    .unwrap_or(0);
+            Some(DebugSession { rpc_url: rpc_url.clone(), rpc_port, snapshot_count })
         } else {
             None
         };
@@ -789,6 +1726,7 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
             gas_used: gas_used.map(|g| g.to_string()),
             gas_limit_suggested,
             raw_trace: Some(enriched_trace),
+            rendered_trace,
             debug_session,
             debug_level: Some(DebugLevel::SourceInstrumented),
         })
@@ -808,14 +1746,15 @@ async fn simulate_onchain(job: &SimulationJob, keep_alive: bool) -> Result<(Simu
     }
 }
 
-async fn simulate_local(job: &SimulationJob, keep_alive: bool) -> Result<(SimulationResult, Option<Engine>), SimulatorError> {
+async fn simulate_local(
+    job: &SimulationJob,
+    keep_alive: bool,
+) -> Result<(SimulationResult, Option<Engine>), SimulatorError> {
     let transaction = job.transaction.as_ref().ok_or_else(|| {
         SimulatorError::Simulation("transaction payload required for local mode".into())
     })?;
 
-    let provided_artifacts = load_user_artifacts(job)?;
-
-    match simulate_local_with_engine(job, transaction, provided_artifacts.as_ref(), keep_alive).await {
+    match simulate_local_with_engine(job, transaction, keep_alive).await {
         Ok((result, engine)) => Ok((result, engine)),
         Err(engine_error) => {
             warn!(
@@ -844,7 +1783,6 @@ async fn simulate_local(job: &SimulationJob, keep_alive: bool) -> Result<(Simula
 async fn simulate_local_with_engine(
     job: &SimulationJob,
     transaction: &TransactionPayload,
-    provided_artifacts: Option<&Value>,
     keep_alive: bool,
 ) -> Result<(SimulationResult, Option<Engine>), SimulatorError> {
     let mut tx_env = build_tx_env(transaction, job.chain_id)?;
@@ -870,24 +1808,24 @@ async fn simulate_local_with_engine(
     let block = match provider.get_block_by_number(block_selector).full().await {
         Ok(Some(block)) => block,
         Ok(None) => return Err(SimulatorError::Simulation("fork block not found".into())),
-        Err(full_error) => {
+        Err(_full_error) => {
             // If full transactions fail (deserialization error), try with hashes only
-            warn!("Failed to fetch block with full transactions: {full_error}. Retrying with transaction hashes only...");
+            warn!(
+                "Failed to fetch block with full transactions; retrying with transaction hashes only"
+            );
 
             provider
                 .get_block_by_number(block_selector)
                 .await
-                .map_err(|error| SimulatorError::Rpc(format!("failed to fetch fork block (fallback): {error}")))?
+                .map_err(|error| {
+                    SimulatorError::Rpc(format!("failed to fetch fork block (fallback): {error}"))
+                })?
                 .ok_or_else(|| SimulatorError::Simulation("fork block not found".into()))?
         }
     };
 
     let block_number_u64 = block.header.number;
-    let spec_id = if chain_id == 1 {
-        get_mainnet_spec_id(block_number_u64)
-    } else {
-        get_mainnet_spec_id(block_number_u64)
-    };
+    let spec_id = get_mainnet_spec_id(block_number_u64);
 
     let fork_info = ForkInfo {
         block_number: block_number_u64,
@@ -935,7 +1873,10 @@ async fn simulate_local_with_engine(
                 ))
             } else {
                 block.header.excess_blob_gas.map(|g| {
-                    BlobExcessGasAndPrice::new(g, get_blob_base_fee_update_fraction_by_spec_id(spec_id))
+                    BlobExcessGasAndPrice::new(
+                        g,
+                        get_blob_base_fee_update_fraction_by_spec_id(spec_id),
+                    )
                 })
             };
             block_env.beneficiary = block.header.beneficiary;
@@ -956,9 +1897,21 @@ async fn simulate_local_with_engine(
     let fork_result =
         ForkResult { fork_info, context, target_tx_env: tx_env, target_tx_hash: pseudo_tx_hash };
 
+    let precompute_hook_states = env_flag("EDB_PRECOMPUTE_HOOK_STATES", false);
+
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(job.analysis_options.quick_mode)
-        .with_precompute_state_variables(keep_alive)
+        .with_precompute_state_variables(
+            precompute_hook_states
+                && keep_alive
+                && !job.debug_session_only
+                && !job.analysis_options.quick_mode,
+        )
+        .with_collect_hook_snapshots(keep_alive && job.analysis_options.collect_snapshots)
+        // Trace parity mode: retain full opcode snapshots for rendered trace rows
+        // even in non-keep-alive simulations (reference-aligned gas/stack fidelity).
+        .with_significant_opcode_snapshots_only(false)
+        .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
         engine_config = engine_config.with_etherscan_api_key(key.clone());
@@ -976,8 +1929,18 @@ async fn simulate_local_with_engine(
         info!("Preloading {} FE-compiled artifacts into engine (local mode)", preloaded.len());
     }
 
+    // Create progress channel to stream preparation stages to stderr as JSON lines.
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<edb_common::ProgressMessage>();
+    tokio::spawn(async move {
+        while let Some(msg) = progress_rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&msg) {
+                eprintln!("__EDB_PROGRESS__:{json}");
+            }
+        }
+    });
+
     let rpc_addr = engine
-        .prepare(fork_result, None, preloaded_artifacts)
+        .prepare(fork_result, Some(progress_tx), preloaded_artifacts)
         .await
         .map_err(|e| SimulatorError::Engine(format!("engine preparation failed: {e:?}")))?;
 
@@ -985,16 +1948,66 @@ async fn simulate_local_with_engine(
     let rpc_port = rpc_addr.port();
     let client = Client::new();
 
+    // Fast path for bridge /debug/start fallback:
+    // create a keep-alive debug session without exporting heavy trace payloads.
+    if keep_alive && job.debug_session_only {
+        let snapshot_count: u64 =
+            call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([])).await.unwrap_or(0);
+        let debug_session =
+            Some(DebugSession { rpc_url: rpc_url.clone(), rpc_port, snapshot_count });
+        let result = SimulationResult {
+            mode: SimulationMode::Local,
+            success: true,
+            error: None,
+            warnings: vec!["debugSessionOnly mode enabled: trace payload omitted".to_string()],
+            revert_reason: None,
+            gas_used: None,
+            gas_limit_suggested: None,
+            raw_trace: None,
+            rendered_trace: None,
+            debug_session,
+            debug_level: Some(DebugLevel::SourceInstrumented),
+        };
+        info!("debugSessionOnly keep-alive session created at {}", rpc_url);
+        return Ok((result, Some(engine)));
+    }
+
     let result = async {
-        let trace_value: Value = call_edb_rpc(&client, &rpc_url, "edb_getTrace", json!([])).await?;
+        // Fetch rendered trace (fully decoded rows from Rust engine)
+        let render_start = std::time::Instant::now();
+        let rendered_trace: Option<Value> =
+            match call_edb_rpc(&client, &rpc_url, "edb_getRenderedTrace", json!([])).await {
+                Ok(v) => {
+                    info!(
+                        "[TIMING] local edb_getRenderedTrace RPC call: {:.2}s",
+                        render_start.elapsed().as_secs_f64()
+                    );
+                    Some(v)
+                }
+                Err(e) => {
+                    warn!(
+                        "edb_getRenderedTrace failed (local mode, falling back to FE decode): {e}"
+                    );
+                    None
+                }
+            };
+        let prefer_rendered_lite = rendered_trace.is_some() && !keep_alive;
+
+        // In non-debug V3 mode, request a bytecode-stripped trace payload.
+        let trace_method = if prefer_rendered_lite { "edb_getTraceLite" } else { "edb_getTrace" };
+        let trace_start = std::time::Instant::now();
+        let trace_value: Value = call_edb_rpc(&client, &rpc_url, trace_method, json!([])).await?;
+        info!(
+            "[TIMING] local {} RPC call: {:.2}s",
+            trace_method,
+            trace_start.elapsed().as_secs_f64()
+        );
         let (success, revert_reason) = analyze_trace(&trace_value);
 
         // PRIORITY 1: Extract total_gas_used from trace root (includes gas refunds from ExecutionResult)
         // This is set by replay_and_collect_trace from ExecutionResult.gas_used
-        let total_gas_used = trace_value
-            .get("total_gas_used")
-            .and_then(|g| g.as_u64())
-            .map(|g| g.to_string());
+        let total_gas_used =
+            trace_value.get("total_gas_used").and_then(|g| g.as_u64()).map(|g| g.to_string());
 
         // FALLBACK: Extract gas_used from root trace entry (inner.inner[0].gas_used)
         // This comes from REVM's outcome.gas.spent() - does NOT include refunds
@@ -1011,33 +2024,34 @@ async fn simulate_local_with_engine(
 
         // Calculate suggested gas limit (120% of gas_used)
         let gas_limit_suggested = gas_used.as_ref().and_then(|g| {
-            g.parse::<u64>().ok().map(|gas| {
-                gas.saturating_mul(120).saturating_div(100).to_string()
-            })
+            g.parse::<u64>().ok().map(|gas| gas.saturating_mul(120).saturating_div(100).to_string())
         });
 
-        // When keep_alive is enabled, use lazy snapshots - frontend will fetch on-demand via RPC
-        let enriched_trace = enrich_trace_payload(
+        // When rendered trace is available and we're not in keep-alive debug mode,
+        // skip heavy rawTrace enrichment fields (snapshots/sources/opcode mapping)
+        // because FE V3 consumes renderedTrace directly.
+        let mut enriched_trace = enrich_trace_payload(
             &client,
             &rpc_url,
             chain_id,
             trace_value,
             provided_artifacts.as_ref(),
             keep_alive, // lazy_snapshots = true when keep_alive is enabled
+            prefer_rendered_lite,
         )
         .await;
+        if let Some(ref rendered) = rendered_trace {
+            backfill_storage_diffs_from_rendered_trace(&mut enriched_trace, rendered);
+        }
 
         // Include debug session info when keep_alive is enabled
         let debug_session = if keep_alive {
             // Fetch snapshot count for debug session
-            let snapshot_count: u64 = call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([]))
-                .await
-                .unwrap_or(0);
-            Some(DebugSession {
-                rpc_url: rpc_url.clone(),
-                rpc_port,
-                snapshot_count,
-            })
+            let snapshot_count: u64 =
+                call_edb_rpc(&client, &rpc_url, "edb_getSnapshotCount", json!([]))
+                    .await
+                    .unwrap_or(0);
+            Some(DebugSession { rpc_url: rpc_url.clone(), rpc_port, snapshot_count })
         } else {
             None
         };
@@ -1051,6 +2065,7 @@ async fn simulate_local_with_engine(
             gas_used,
             gas_limit_suggested,
             raw_trace: Some(enriched_trace),
+            rendered_trace,
             debug_session,
             debug_level: Some(DebugLevel::SourceInstrumented),
         })
@@ -1084,27 +2099,32 @@ async fn simulate_local_fallback(
         engine_error
     );
 
-    let gas_estimate_hex: String =
-        match call_edb_rpc(&client, &job.rpc_url, "eth_estimateGas", json!([tx_object.clone(), block_param]))
-            .await
-        {
-            Ok(val) => val,
-            Err(err) => {
-                let message = err.to_string();
-                return Ok(SimulationResult {
-                    mode: SimulationMode::Local,
-                    success: false,
-                    error: Some(message.clone()),
-                    warnings: vec![fallback_warning],
-                    revert_reason: Some(message),
-                    gas_used: None,
-                    gas_limit_suggested: None,
-                    raw_trace: None,
-                    debug_session: None,
-                    debug_level: Some(DebugLevel::EthCallOnly),
-                });
-            }
-        };
+    let gas_estimate_hex: String = match call_edb_rpc(
+        &client,
+        &job.rpc_url,
+        "eth_estimateGas",
+        json!([tx_object.clone(), block_param]),
+    )
+    .await
+    {
+        Ok(val) => val,
+        Err(err) => {
+            let message = err.to_string();
+            return Ok(SimulationResult {
+                mode: SimulationMode::Local,
+                success: false,
+                error: Some(message.clone()),
+                warnings: vec![fallback_warning],
+                revert_reason: Some(message),
+                gas_used: None,
+                gas_limit_suggested: None,
+                raw_trace: None,
+                rendered_trace: None,
+                debug_session: None,
+                debug_level: Some(DebugLevel::EthCallOnly),
+            });
+        }
+    };
 
     let gas_estimate_decimal = hex_to_u128(&gas_estimate_hex)?;
     let suggested_limit = gas_estimate_decimal.saturating_mul(120).saturating_div(100);
@@ -1132,6 +2152,7 @@ async fn simulate_local_fallback(
                 gas_used: Some(gas_estimate_decimal.to_string()),
                 gas_limit_suggested: Some(suggested_limit.to_string()),
                 raw_trace: Some(Value::Object(raw_map)),
+                rendered_trace: None,
                 debug_session: None,
                 debug_level: Some(DebugLevel::EthCallOnly),
             })
@@ -1148,6 +2169,7 @@ async fn simulate_local_fallback(
                 gas_used: Some(gas_estimate_decimal.to_string()),
                 gas_limit_suggested: Some(suggested_limit.to_string()),
                 raw_trace: Some(Value::Object(raw_map)),
+                rendered_trace: None,
                 debug_session: None,
                 debug_level: Some(DebugLevel::EthCallOnly),
             })
@@ -1191,7 +2213,9 @@ async fn simulate_local_lightweight(
             provider
                 .get_block_by_number(block_selector)
                 .await
-                .map_err(|error| SimulatorError::Rpc(format!("failed to fetch fork block: {error}")))?
+                .map_err(|error| {
+                    SimulatorError::Rpc(format!("failed to fetch fork block: {error}"))
+                })?
                 .ok_or_else(|| SimulatorError::Simulation("fork block not found".into()))?
         }
     };
@@ -1234,7 +2258,10 @@ async fn simulate_local_lightweight(
                 ))
             } else {
                 block.header.excess_blob_gas.map(|g| {
-                    BlobExcessGasAndPrice::new(g, get_blob_base_fee_update_fraction_by_spec_id(spec_id))
+                    BlobExcessGasAndPrice::new(
+                        g,
+                        get_blob_base_fee_update_fraction_by_spec_id(spec_id),
+                    )
                 })
             };
             block_env.beneficiary = block.header.beneficiary;
@@ -1256,9 +2283,9 @@ async fn simulate_local_lightweight(
     let mut evm = context_builder.build_mainnet_with_inspector(&mut tracer);
 
     // Execute the transaction
-    let exec_result = evm
-        .inspect_one_tx(tx_env)
-        .map_err(|e| SimulatorError::Simulation(format!("transaction execution failed: {:?}", e)))?;
+    let exec_result = evm.inspect_one_tx(tx_env).map_err(|e| {
+        SimulatorError::Simulation(format!("transaction execution failed: {:?}", e))
+    })?;
 
     // Extract results
     let (success, gas_used, revert_reason) = match exec_result {
@@ -1279,10 +2306,8 @@ async fn simulate_local_lightweight(
     let trace_json = serde_json::to_value(&replay_result.execution_trace)
         .unwrap_or_else(|_| json!({"error": "failed to serialize trace"}));
 
-    let warning = format!(
-        "Lightweight trace mode (source instrumentation unavailable: {})",
-        engine_error
-    );
+    let warning =
+        format!("Lightweight trace mode (source instrumentation unavailable: {})", engine_error);
 
     Ok(SimulationResult {
         mode: SimulationMode::Local,
@@ -1293,6 +2318,7 @@ async fn simulate_local_lightweight(
         gas_used: Some(gas_used.to_string()),
         gas_limit_suggested: Some((gas_used.saturating_mul(120) / 100).to_string()),
         raw_trace: Some(trace_json),
+        rendered_trace: None,
         debug_session: None,
         debug_level: Some(DebugLevel::CallTrace),
     })
@@ -1645,13 +2671,17 @@ async fn enrich_trace_payload(
     trace_value: Value,
     user_artifacts: Option<&Value>,
     lazy_snapshots: bool,
+    prefer_rendered_lite: bool,
 ) -> Value {
     let mut payload = Map::new();
     payload.insert("inner".into(), trace_value.clone());
 
-    // Best-effort fetch of verified sources for any contracts seen in the trace
-    if let Some(source_map) = collect_sources(client, rpc_url, &trace_value).await {
-        payload.insert("sources".into(), source_map);
+    // Best-effort fetch of verified sources for any contracts seen in the trace.
+    // In rendered-trace lite mode, skip this heavy payload field.
+    if !prefer_rendered_lite {
+        if let Some(source_map) = collect_sources(client, rpc_url, &trace_value).await {
+            payload.insert("sources".into(), source_map);
+        }
     }
     // Best-effort fetch of full artifacts (with metadata/source map) for the same addresses
     // User-provided artifacts have priority ONLY if they have compiled output with source maps.
@@ -1666,36 +2696,178 @@ async fn enrich_trace_payload(
             .and_then(Value::as_object)
             .map(|contracts| {
                 contracts.values().any(|c| {
-                    c.as_object().map(|cobj| {
-                        cobj.values().any(|contract| {
-                            let evm = contract.get("evm");
-                            let deployed_bytecode = evm.and_then(|e| e.get("deployedBytecode"));
-                            // Check all possible source map locations:
-                            // 1. evm.deployedSourceMap (some compilers)
-                            // 2. evm.deployed_source_map (snake_case variant)
-                            // 3. evm.deployedBytecode.sourceMap (foundry-compilers)
-                            // 4. evm.deployedBytecode.source_map (snake_case variant)
-                            let has_srcmap = evm
-                                .and_then(|e| e.get("deployedSourceMap").or_else(|| e.get("deployed_source_map")))
-                                .and_then(Value::as_str)
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false)
-                                || deployed_bytecode
-                                    .and_then(|d| d.get("sourceMap").or_else(|| d.get("source_map")))
+                    c.as_object()
+                        .map(|cobj| {
+                            cobj.values().any(|contract| {
+                                let evm = contract.get("evm");
+                                let deployed_bytecode = evm.and_then(|e| e.get("deployedBytecode"));
+                                // Check all possible source map locations:
+                                // 1. evm.deployedSourceMap (some compilers)
+                                // 2. evm.deployed_source_map (snake_case variant)
+                                // 3. evm.deployedBytecode.sourceMap (foundry-compilers)
+                                // 4. evm.deployedBytecode.source_map (snake_case variant)
+                                let has_srcmap = evm
+                                    .and_then(|e| {
+                                        e.get("deployedSourceMap")
+                                            .or_else(|| e.get("deployed_source_map"))
+                                    })
+                                    .and_then(Value::as_str)
+                                    .map(|s| !s.is_empty())
+                                    .unwrap_or(false)
+                                    || deployed_bytecode
+                                        .and_then(|d| {
+                                            d.get("sourceMap").or_else(|| d.get("source_map"))
+                                        })
+                                        .and_then(Value::as_str)
+                                        .map(|s| !s.is_empty())
+                                        .unwrap_or(false);
+                                let has_bytecode = deployed_bytecode
+                                    .and_then(|d| d.get("object"))
                                     .and_then(Value::as_str)
                                     .map(|s| !s.is_empty())
                                     .unwrap_or(false);
-                            let has_bytecode = deployed_bytecode
-                                .and_then(|d| d.get("object"))
-                                .and_then(Value::as_str)
-                                .map(|s| !s.is_empty())
-                                .unwrap_or(false);
-                            has_srcmap && has_bytecode
+                                has_srcmap && has_bytecode
+                            })
                         })
-                    }).unwrap_or(false)
+                        .unwrap_or(false)
                 })
             })
             .unwrap_or(false)
+    }
+
+    // In rendered-trace fast path, keep only metadata and source file indices
+    // to avoid shipping tens of MB of duplicated source contents.
+    fn maybe_compact_artifact(artifact: &Value, prefer_rendered_lite: bool) -> Value {
+        if !prefer_rendered_lite {
+            return artifact.clone();
+        }
+
+        fn source_index_only(sources: Option<&Map<String, Value>>) -> Option<Value> {
+            let mut out = Map::new();
+            if let Some(srcs) = sources {
+                for path in srcs.keys() {
+                    out.insert(path.clone(), Value::Object(Map::new()));
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(Value::Object(out))
+            }
+        }
+
+        let mut compact = Map::new();
+
+        if let Some(meta) = artifact.get("meta") {
+            compact.insert("meta".into(), meta.clone());
+        }
+
+        if let Some(input) = artifact.get("input").and_then(Value::as_object) {
+            let mut input_compact = Map::new();
+            if let Some(settings) = input.get("settings") {
+                input_compact.insert("settings".into(), settings.clone());
+            }
+            if let Some(source_index) =
+                source_index_only(input.get("sources").and_then(Value::as_object))
+            {
+                input_compact.insert("sources".into(), source_index);
+            }
+            if !input_compact.is_empty() {
+                compact.insert("input".into(), Value::Object(input_compact));
+            }
+        }
+
+        if let Some(source_index) =
+            source_index_only(artifact.get("sources").and_then(Value::as_object))
+        {
+            compact.insert("sources".into(), source_index);
+        }
+
+        if let Some(output) = artifact.get("output").and_then(Value::as_object) {
+            let mut output_compact = Map::new();
+            if let Some(contract_index) =
+                source_index_only(output.get("contracts").and_then(Value::as_object))
+            {
+                output_compact.insert("contracts".into(), contract_index);
+            }
+            if let Some(source_index) =
+                source_index_only(output.get("sources").and_then(Value::as_object))
+            {
+                output_compact.insert("sources".into(), source_index);
+            }
+            if !output_compact.is_empty() {
+                compact.insert("output".into(), Value::Object(output_compact));
+            }
+
+            // Extract storageLayout from output.contracts before it gets compacted away.
+            // The layout lives at output.contracts[filename][contractname].storageLayout
+            // in standard Solidity compiler output format.  Hoist to compact top-level so
+            // the bridge can read it at artifact.storageLayout.
+            if let Some(contracts) = output.get("contracts").and_then(Value::as_object) {
+                // Prefer matching the contract name from meta if available
+                let meta_name = artifact
+                    .get("meta")
+                    .and_then(Value::as_object)
+                    .and_then(|m| {
+                        m.get("ContractName")
+                            .or_else(|| m.get("Name"))
+                            .and_then(Value::as_str)
+                    });
+
+                let mut found_layout: Option<&Value> = None;
+
+                'outer: for file_contracts in contracts.values() {
+                    if let Some(file_obj) = file_contracts.as_object() {
+                        // First pass: match by contract name
+                        if let Some(name) = meta_name {
+                            if let Some(contract) = file_obj.get(name) {
+                                if let Some(sl) = contract.get("storageLayout") {
+                                    if sl.get("storage").and_then(Value::as_array).is_some() {
+                                        found_layout = Some(sl);
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: take first valid storageLayout from any contract
+                if found_layout.is_none() {
+                    'fallback: for file_contracts in contracts.values() {
+                        if let Some(file_obj) = file_contracts.as_object() {
+                            for contract in file_obj.values() {
+                                if let Some(sl) = contract.get("storageLayout") {
+                                    if sl.get("storage").and_then(Value::as_array).is_some() {
+                                        found_layout = Some(sl);
+                                        break 'fallback;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(layout) = found_layout {
+                    compact.insert("storageLayout".into(), layout.clone());
+                }
+            }
+        }
+
+        // Also check for top-level storageLayout (already hoisted by engine or preload)
+        if !compact.contains_key("storageLayout") {
+            if let Some(sl) = artifact.get("storageLayout") {
+                if sl.get("storage").and_then(Value::as_array).is_some() {
+                    compact.insert("storageLayout".into(), sl.clone());
+                }
+            }
+        }
+
+        if compact.is_empty() {
+            artifact.clone()
+        } else {
+            Value::Object(compact)
+        }
     }
 
     // 1) Collect ALL user-provided artifacts (not just those with source maps)
@@ -1719,27 +2891,32 @@ async fn enrich_trace_payload(
     // 2) Sourcify metadata - SKIP addresses where user already provided artifacts
     // This is the key optimization: avoid HTTP requests for addresses we already have
     // Always use lowercase keys to avoid duplicate entries
-    if let Some(sourcify_map) = collect_sourcify_artifacts(chain_id, &trace_value, &user_addrs_all).await {
-        if let Some(obj) = sourcify_map.as_object() {
-            info!("Sourcify returned metadata for {} addresses", obj.len());
-            for (addr, artifact) in obj {
-                let addr_lower = addr.to_lowercase();
-                let has_output_contracts = artifact
-                    .get("output")
-                    .and_then(|o| o.get("contracts"))
-                    .is_some();
-                let sourcify_has_srcmaps = has_source_maps(artifact);
-                info!(
-                    "Sourcify artifact for {}: has_output_contracts={}, has_srcmaps={}",
-                    addr_lower, has_output_contracts, sourcify_has_srcmaps
-                );
-                if !user_addrs_with_srcmaps.contains(&addr_lower) {
-                    artifacts_obj.insert(addr_lower, artifact.clone());
+    if !prefer_rendered_lite {
+        if let Some(sourcify_map) =
+            collect_sourcify_artifacts(chain_id, &trace_value, &user_addrs_all).await
+        {
+            if let Some(obj) = sourcify_map.as_object() {
+                info!("Sourcify returned metadata for {} addresses", obj.len());
+                for (addr, artifact) in obj {
+                    let addr_lower = addr.to_lowercase();
+                    let has_output_contracts =
+                        artifact.get("output").and_then(|o| o.get("contracts")).is_some();
+                    let sourcify_has_srcmaps = has_source_maps(artifact);
+                    info!(
+                        "Sourcify artifact for {}: has_output_contracts={}, has_srcmaps={}",
+                        addr_lower, has_output_contracts, sourcify_has_srcmaps
+                    );
+                    if !user_addrs_with_srcmaps.contains(&addr_lower) {
+                        artifacts_obj.insert(
+                            addr_lower,
+                            maybe_compact_artifact(artifact, prefer_rendered_lite),
+                        );
+                    }
                 }
             }
+        } else {
+            info!("No Sourcify metadata returned");
         }
-    } else {
-        info!("No Sourcify metadata returned");
     }
 
     // 3) Engine RPC - prefer these over Sourcify if they have source maps (Sourcify metadata.json doesn't include source maps)
@@ -1750,30 +2927,32 @@ async fn enrich_trace_payload(
                 let addr_lower = addr.to_lowercase();
                 // Skip if user already provided an artifact with source maps
                 if user_addrs_with_srcmaps.contains(&addr_lower) {
-                    info!("Skipping Engine artifact for {} - user provided with srcmaps", addr_lower);
+                    info!(
+                        "Skipping Engine artifact for {} - user provided with srcmaps",
+                        addr_lower
+                    );
                     continue;
                 }
                 // Check if existing artifact (from Sourcify) has source maps
                 let existing_has_srcmaps = artifacts_obj
                     .get(&addr_lower)
-                    .map(|a| has_source_maps(a))
+                    .map(has_source_maps)
                     .unwrap_or(false);
                 let engine_has_srcmaps = has_source_maps(artifact);
-                let has_output_contracts = artifact
-                    .get("output")
-                    .and_then(|o| o.get("contracts"))
-                    .is_some();
-                let has_output_sources = artifact
-                    .get("output")
-                    .and_then(|o| o.get("sources"))
-                    .is_some();
+                let has_output_contracts =
+                    artifact.get("output").and_then(|o| o.get("contracts")).is_some();
+                let has_output_sources =
+                    artifact.get("output").and_then(|o| o.get("sources")).is_some();
                 info!(
                     "Engine artifact for {}: has_output_contracts={}, has_output_sources={}, has_srcmaps={}, existing_has_srcmaps={}",
                     addr_lower, has_output_contracts, has_output_sources, engine_has_srcmaps, existing_has_srcmaps
                 );
                 // Only skip if existing artifact already has source maps
                 if !existing_has_srcmaps {
-                    artifacts_obj.insert(addr_lower.clone(), artifact.clone());
+                    artifacts_obj.insert(
+                        addr_lower.clone(),
+                        maybe_compact_artifact(artifact, prefer_rendered_lite),
+                    );
                     info!("Inserted Engine artifact for {}", addr_lower);
                 } else {
                     info!("Keeping existing artifact for {} (already has srcmaps)", addr_lower);
@@ -1785,34 +2964,110 @@ async fn enrich_trace_payload(
     }
 
     // 4) User-provided artifacts with source maps get added last (highest priority)
-    // Use lowercase keys for consistency
+    // Use lowercase keys for consistency.
+    //
+    // 5) Also keep FE-provided artifacts without source maps when no richer artifact
+    // exists for that address. This preserves contract naming/context for decode/UI
+    // attribution without overriding source-map-capable artifacts used for jump mapping.
+    let mut inserted_user_fallback = 0usize;
     if let Some(user_obj) = user_artifacts.and_then(|v| v.as_object()) {
         for (addr, artifact) in user_obj {
+            let addr_lower = addr.to_lowercase();
             if has_source_maps(artifact) {
-                artifacts_obj.insert(addr.to_lowercase(), artifact.clone());
+                artifacts_obj
+                    .insert(addr_lower, maybe_compact_artifact(artifact, prefer_rendered_lite));
+                continue;
+            }
+            if !artifacts_obj.contains_key(&addr_lower) {
+                artifacts_obj
+                    .insert(addr_lower, maybe_compact_artifact(artifact, prefer_rendered_lite));
+                inserted_user_fallback += 1;
             }
         }
+    }
+    if inserted_user_fallback > 0 {
+        info!(
+            "Inserted {} FE artifact(s) without source maps as attribution fallback",
+            inserted_user_fallback
+        );
     }
     if !artifacts_obj.is_empty() {
-        payload.insert("artifacts".into(), Value::Object(artifacts_obj));
+        payload.insert("artifacts".into(), Value::Object(artifacts_obj.clone()));
     }
 
-    match collect_storage_diff_entries(client, rpc_url).await {
-        Ok(storage_value) => {
-            if !storage_value.is_null() {
-                payload.insert("storageDiffs".into(), storage_value);
+    // Build an opcode-mapping artifact map that prefers recompiled (instrumented) artifacts.
+    // This is used ONLY for opcode line mapping and is not exposed to the frontend.
+    let opcode_artifacts_override = if prefer_rendered_lite {
+        None
+    } else if let Some(recompiled_map) =
+        collect_recompiled_artifacts(client, rpc_url, &trace_value).await
+    {
+        if let Some(recompiled_obj) = recompiled_map.as_object() {
+            let mut merged = artifacts_obj.clone();
+            let mut inserted = 0usize;
+            for (addr, artifact) in recompiled_obj {
+                if !has_source_maps(artifact) {
+                    continue;
+                }
+                let addr_lower = addr.to_lowercase();
+                let existing_has_srcmaps = merged
+                    .get(&addr_lower)
+                    .map(has_source_maps)
+                    .unwrap_or(false);
+                if existing_has_srcmaps {
+                    // Keep the original artifact when it already has source maps.
+                    // Runtime opcode snapshots are captured before bytecode tweak in most flows,
+                    // so replacing with instrumented artifacts can degrade PC/src alignment.
+                    continue;
+                }
+                merged.insert(addr_lower, artifact.clone());
+                inserted += 1;
+            }
+            if inserted > 0 {
+                info!(
+                    "Opcode mapping: added {} recompiled artifact(s) without source-mapped originals",
+                    inserted
+                );
+                Some(Value::Object(merged))
             } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // In rendered-trace lite mode, skip expensive storage-diff RPC calls.
+    // We backfill storageDiffs from rendered SSTORE rows after this function returns.
+    if prefer_rendered_lite {
+        info!(
+            "[PERF] rendered-lite mode: skipping storage diff RPC export; using rendered trace backfill"
+        );
+        payload.insert("storageDiffs".into(), Value::Array(Vec::new()));
+    } else {
+        match collect_storage_diff_entries(client, rpc_url).await {
+            Ok(storage_value) => {
+                if !storage_value.is_null() {
+                    payload.insert("storageDiffs".into(), storage_value);
+                } else {
+                    payload.insert("storageDiffs".into(), Value::Array(Vec::new()));
+                }
+            }
+            Err(err) => {
+                warn!("failed to collect storage diffs: {err:?}");
                 payload.insert("storageDiffs".into(), Value::Array(Vec::new()));
             }
-        }
-        Err(err) => {
-            warn!("failed to collect storage diffs: {err:?}");
-            payload.insert("storageDiffs".into(), Value::Array(Vec::new()));
         }
     }
 
     // Snapshot collection: skip if lazy_snapshots is enabled (frontend will fetch on-demand)
-    if lazy_snapshots {
+    if prefer_rendered_lite {
+        payload.insert("snapshotCount".into(), Value::Number(0.into()));
+        payload.insert("snapshots".into(), Value::Array(Vec::new()));
+        payload.insert("opcodeTrace".into(), Value::Array(Vec::new()));
+    } else if lazy_snapshots {
         info!("[PERF] Lazy snapshots enabled - skipping upfront snapshot export");
         // Just include the snapshot count so frontend knows how many are available
         match call_edb_rpc::<u64>(client, rpc_url, "edb_getSnapshotCount", json!([])).await {
@@ -1833,8 +3088,11 @@ async fn enrich_trace_payload(
         match call_edb_rpc::<Value>(client, rpc_url, "edb_getOpcodeTrace", json!([])).await {
             Ok(opcode_trace) => {
                 let count = opcode_trace.as_array().map(|a| a.len()).unwrap_or(0);
-                info!("[PERF] Fetched lightweight opcode trace with {} entries in {:.2}s",
-                    count, opcode_start.elapsed().as_secs_f64());
+                info!(
+                    "[PERF] Fetched lightweight opcode trace with {} entries in {:.2}s",
+                    count,
+                    opcode_start.elapsed().as_secs_f64()
+                );
                 payload.insert("opcodeTrace".into(), opcode_trace);
             }
             Err(err) => {
@@ -1854,16 +3112,22 @@ async fn enrich_trace_payload(
         }
     }
 
-    // Best-effort: derive opcode source mapping using artifacts + opcode snapshots
-    if let Some(artifacts) = payload.get("artifacts") {
-        let snapshots_ref = payload.get("snapshots").unwrap_or(&Value::Null);
-        let trace_ref = payload.get("inner");
-        if let Some(opcode_map) = enrich_opcodes_with_lines(artifacts, snapshots_ref, trace_ref) {
-            let count = opcode_map.as_object().map(|o| o.len()).unwrap_or(0);
-            info!("embedded opcode line mapping for {} contract(s)", count);
-            payload.insert("opcodeLines".into(), opcode_map);
-        } else {
-            warn!("opcode line mapping not generated (missing source map?)");
+    // Best-effort: derive opcode source mapping using artifacts + opcode snapshots.
+    // Prefer recompiled artifacts when available to match instrumented bytecode PCs.
+    if !prefer_rendered_lite {
+        let opcode_artifacts =
+            opcode_artifacts_override.as_ref().or_else(|| payload.get("artifacts"));
+        if let Some(artifacts) = opcode_artifacts {
+            let snapshots_ref = payload.get("snapshots").unwrap_or(&Value::Null);
+            let trace_ref = payload.get("inner");
+            if let Some(opcode_map) = enrich_opcodes_with_lines(artifacts, snapshots_ref, trace_ref)
+            {
+                let count = opcode_map.as_object().map(|o| o.len()).unwrap_or(0);
+                info!("embedded opcode line mapping for {} contract(s)", count);
+                payload.insert("opcodeLines".into(), opcode_map);
+            } else {
+                warn!("opcode line mapping not generated (missing source map?)");
+            }
         }
     }
 
@@ -1881,6 +3145,89 @@ async fn enrich_trace_payload(
     Value::Object(payload)
 }
 
+/// If storageDiffs is empty but rendered trace is available, reconstruct diffs from SSTORE rows.
+/// This keeps State tab richness when non-debug fast path skips hook snapshots.
+fn backfill_storage_diffs_from_rendered_trace(payload: &mut Value, rendered_trace: &Value) {
+    let Some(payload_obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    let should_backfill = payload_obj
+        .get("storageDiffs")
+        .and_then(Value::as_array)
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+    if !should_backfill {
+        return;
+    }
+
+    let Some(rows) = rendered_trace.get("rows").and_then(Value::as_array) else {
+        return;
+    };
+
+    // Build trace_id -> target address map from raw trace entries.
+    let trace_entries =
+        payload_obj.get("inner").and_then(|v| v.get("inner").or(Some(v))).and_then(Value::as_array);
+    let mut trace_id_to_target: HashMap<u64, String> = HashMap::new();
+    if let Some(entries) = trace_entries {
+        for entry in entries {
+            let id = entry.get("id").and_then(Value::as_u64);
+            let target = entry.get("target").and_then(Value::as_str);
+            if let (Some(id), Some(target)) = (id, target) {
+                trace_id_to_target.insert(id, target.to_string());
+            }
+        }
+    }
+
+    // Keep the last write per (address, slot).
+    let mut diffs_by_key: HashMap<String, Value> = HashMap::new();
+    for row in rows {
+        let is_sstore = row.get("name").and_then(Value::as_str) == Some("SSTORE");
+        if !is_sstore {
+            continue;
+        }
+
+        let storage_write = match row.get("storageWrite").or_else(|| row.get("storage_write")) {
+            Some(v) => v,
+            None => continue,
+        };
+        let slot =
+            storage_write.get("slot").and_then(Value::as_str).unwrap_or_default().to_string();
+        if slot.is_empty() {
+            continue;
+        }
+        let before = storage_write.get("before").cloned().unwrap_or(Value::Null);
+        let after = storage_write.get("after").cloned().unwrap_or(Value::Null);
+
+        let trace_id = row.get("traceId").or_else(|| row.get("trace_id")).and_then(Value::as_u64);
+        let address = trace_id
+            .and_then(|id| trace_id_to_target.get(&id).cloned())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let key = format!("{}:{}", address.to_lowercase(), slot.to_lowercase());
+        diffs_by_key.insert(
+            key,
+            json!({
+                "address": address,
+                "slot": slot,
+                "key": storage_write.get("slot").cloned().unwrap_or(Value::Null),
+                "before": before,
+                "after": after,
+                "value": storage_write.get("after").cloned().unwrap_or(Value::Null),
+                "snapshotId": Value::Null
+            }),
+        );
+    }
+
+    if diffs_by_key.is_empty() {
+        return;
+    }
+
+    let diffs: Vec<Value> = diffs_by_key.into_values().collect();
+    info!("[PERF] Backfilled {} storage diff entries from rendered trace rows", diffs.len());
+    payload_obj.insert("storageDiffs".into(), Value::Array(diffs));
+}
+
 /// Load user-provided artifacts from a path or inline value.
 fn load_user_artifacts(job: &SimulationJob) -> Result<Option<Value>, SimulatorError> {
     let mut merged = Map::new();
@@ -1890,8 +3237,9 @@ fn load_user_artifacts(job: &SimulationJob) -> Result<Option<Value>, SimulatorEr
     }
 
     if let Some(path) = job.artifact_path.as_ref() {
-        let data = fs::read_to_string(Path::new(path))
-            .map_err(|e| SimulatorError::Simulation(format!("failed to read artifact file: {e}")))?;
+        let data = fs::read_to_string(Path::new(path)).map_err(|e| {
+            SimulatorError::Simulation(format!("failed to read artifact file: {e}"))
+        })?;
         let value: Value = serde_json::from_str(&data).map_err(|e| {
             SimulatorError::Simulation(format!("failed to parse artifact file as JSON: {e}"))
         })?;
@@ -1925,6 +3273,7 @@ fn preload_artifacts_from_job(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let total = artifacts_json.len();
+    let mut compile_tasks: Vec<(Address, String, Value, Value, Value)> = Vec::new();
 
     for (addr_str, artifact_json) in artifacts_json {
         // Parse address
@@ -1963,8 +3312,26 @@ fn preload_artifacts_from_job(
             }
         };
 
-        // Try to build Artifact
-        match build_artifact_from_json(addr_str, artifact_json, input_obj, settings_json) {
+        compile_tasks.push((
+            address,
+            addr_str.clone(),
+            artifact_json.clone(),
+            input_obj.clone(),
+            settings_json.clone(),
+        ));
+    }
+
+    let compile_results: Vec<(Address, String, Result<Artifact, eyre::Error>)> = compile_tasks
+        .into_par_iter()
+        .map(|(address, addr_str, artifact_json, input_obj, settings_json)| {
+            let artifact =
+                build_artifact_from_json(&artifact_json, &input_obj, &settings_json);
+            (address, addr_str, artifact)
+        })
+        .collect();
+
+    for (address, addr_str, artifact_result) in compile_results {
+        match artifact_result {
             Ok(artifact) => {
                 info!("Preloaded artifact for {} ({})", addr_str, artifact.contract_name());
                 preloaded.insert(address, artifact);
@@ -1978,7 +3345,10 @@ fn preload_artifacts_from_job(
 
     info!(
         "[PRELOAD] Summary: {} received, {} compiled, {} skipped (no settings), {} failed",
-        total, preloaded.len(), skipped, failed
+        total,
+        preloaded.len(),
+        skipped,
+        failed
     );
 
     if preloaded.is_empty() {
@@ -1990,7 +3360,6 @@ fn preload_artifacts_from_job(
 
 /// Build an Artifact from FE-provided JSON, compiling with the specified settings.
 fn build_artifact_from_json(
-    addr_str: &str,
     artifact_json: &Value,
     input_obj: &Value,
     settings_json: &Value,
@@ -2037,36 +3406,26 @@ fn build_artifact_from_json(
 
     // Check for compilation errors
     if output.errors.iter().any(|e| e.is_error()) {
-        let errors: Vec<_> = output.errors.iter()
-            .filter(|e| e.is_error())
-            .map(|e| e.message.clone())
-            .collect();
+        let errors: Vec<_> =
+            output.errors.iter().filter(|e| e.is_error()).map(|e| e.message.clone()).collect();
         return Err(eyre::eyre!("compilation errors: {:?}", errors));
     }
 
     // Synthesize Metadata (same pattern as sourcify.rs)
     let meta_obj = artifact_json.get("meta").cloned().unwrap_or(Value::Null);
-    let contract_name = meta_obj.get("ContractName")
+    let contract_name = meta_obj
+        .get("ContractName")
         .or_else(|| meta_obj.get("Name"))
         .and_then(Value::as_str)
         .unwrap_or("Contract")
         .to_string();
-    let abi_string = meta_obj.get("ABI")
-        .and_then(Value::as_str)
-        .unwrap_or("[]")
-        .to_string();
-    let opt_used = meta_obj.get("OptimizationUsed")
-        .and_then(Value::as_str)
-        .unwrap_or("0")
-        .to_string();
-    let runs_str = meta_obj.get("Runs")
-        .and_then(Value::as_str)
-        .unwrap_or("200");
+    let abi_string = meta_obj.get("ABI").and_then(Value::as_str).unwrap_or("[]").to_string();
+    let opt_used =
+        meta_obj.get("OptimizationUsed").and_then(Value::as_str).unwrap_or("0").to_string();
+    let runs_str = meta_obj.get("Runs").and_then(Value::as_str).unwrap_or("200");
     let runs: u64 = runs_str.parse().unwrap_or(200);
-    let evm_version = meta_obj.get("EVMVersion")
-        .and_then(Value::as_str)
-        .unwrap_or("Default")
-        .to_string();
+    let evm_version =
+        meta_obj.get("EVMVersion").and_then(Value::as_str).unwrap_or("Default").to_string();
 
     // Build source_code field in Etherscan format
     let source_code_field = serde_json::json!({
@@ -2164,6 +3523,26 @@ async fn collect_artifacts(client: &Client, rpc_url: &str, trace_value: &Value) 
         return None;
     }
 
+    // Fast path: single bulk RPC instead of per-address round trips.
+    match call_edb_rpc::<Value>(
+        client,
+        rpc_url,
+        "edb_getArtifactsByAddresses",
+        json!([addrs.clone()]),
+    )
+    .await
+    {
+        Ok(val) => {
+            if val.as_object().map(|obj| !obj.is_empty()).unwrap_or(false) {
+                return Some(val);
+            }
+            return None;
+        }
+        Err(err) => {
+            warn!("bulk artifact fetch failed, falling back to per-address RPC: {err:?}");
+        }
+    }
+
     let mut artifacts = Map::new();
     for addr in addrs {
         match call_edb_rpc::<Value>(client, rpc_url, "edb_getArtifactByAddress", json!([addr]))
@@ -2175,6 +3554,72 @@ async fn collect_artifacts(client: &Client, rpc_url: &str, trace_value: &Value) 
             }
             Err(err) => {
                 warn!("failed to fetch artifact for {addr}: {err:?}");
+            }
+        }
+    }
+
+    if artifacts.is_empty() {
+        None
+    } else {
+        Some(Value::Object(artifacts))
+    }
+}
+
+/// Collect recompiled (instrumented) artifacts for all addresses found in the trace.
+/// This is best-effort and may return partial data if some contracts were not recompiled.
+async fn collect_recompiled_artifacts(
+    client: &Client,
+    rpc_url: &str,
+    trace_value: &Value,
+) -> Option<Value> {
+    let mut addrs = Vec::new();
+    gather_addresses(trace_value, &mut addrs);
+    addrs.sort();
+    addrs.dedup();
+
+    if addrs.is_empty() {
+        return None;
+    }
+
+    // Fast path: single bulk RPC instead of per-address round trips.
+    match call_edb_rpc::<Value>(
+        client,
+        rpc_url,
+        "edb_getRecompiledArtifactsByAddresses",
+        json!([addrs.clone()]),
+    )
+    .await
+    {
+        Ok(val) => {
+            if val.as_object().map(|obj| !obj.is_empty()).unwrap_or(false) {
+                return Some(val);
+            }
+            return None;
+        }
+        Err(err) => {
+            // Older engines may not expose bulk endpoint; fallback keeps compatibility.
+            debug!(
+                "bulk recompiled artifact fetch failed, falling back to per-address RPC: {err:?}"
+            );
+        }
+    }
+
+    let mut artifacts = Map::new();
+    for addr in addrs {
+        match call_edb_rpc::<Value>(
+            client,
+            rpc_url,
+            "edb_getRecompiledArtifactByAddress",
+            json!([addr]),
+        )
+        .await
+        {
+            Ok(val) => {
+                artifacts.insert(addr.to_lowercase(), val);
+            }
+            Err(err) => {
+                // Recompiled artifacts are optional; skip quietly when unavailable.
+                debug!("recompiled artifact missing for {addr}: {err:?}");
             }
         }
     }
@@ -2203,13 +3648,14 @@ async fn collect_sourcify_artifacts(
     }
 
     // Filter out addresses we should skip (already have artifacts from frontend)
-    let addrs_to_fetch: Vec<_> = addrs
-        .into_iter()
-        .filter(|a| !skip_addrs.contains(&a.to_lowercase()))
-        .collect();
+    let addrs_to_fetch: Vec<_> =
+        addrs.into_iter().filter(|a| !skip_addrs.contains(&a.to_lowercase())).collect();
 
     if addrs_to_fetch.is_empty() {
-        info!("Skipping Sourcify fetch - all {} addresses already have artifacts from frontend", skip_addrs.len());
+        info!(
+            "Skipping Sourcify fetch - all {} addresses already have artifacts from frontend",
+            skip_addrs.len()
+        );
         return None;
     }
 
@@ -2467,7 +3913,7 @@ async fn collect_snapshot_entries(
 
 fn extract_before_after(value: &Value) -> (Option<String>, Option<String>) {
     if let Some(arr) = value.as_array() {
-        let before = arr.get(0).and_then(value_to_string);
+        let before = arr.first().and_then(value_to_string);
         let after = arr.get(1).and_then(value_to_string);
         return (before, after);
     }
@@ -2516,7 +3962,9 @@ fn analyze_trace(trace_value: &Value) -> (bool, Option<String>) {
         return (true, None);
     };
 
-    let root = array.iter().find(|entry| entry.get("parent_id").map_or(true, |v| v.is_null()));
+    let root = array
+        .iter()
+        .find(|entry| entry.get("parent_id").is_none_or(Value::is_null));
 
     let Some(root_entry) = root else {
         return (true, None);

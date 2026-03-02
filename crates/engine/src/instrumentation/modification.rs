@@ -16,6 +16,8 @@
 
 use std::{collections::BTreeMap, fmt::Display, sync::Arc};
 
+use foundry_compilers::artifacts::StateMutability;
+
 use crate::{
     analysis::{SourceAnalysis, StepKind, VariableRef},
     instrumentation::codegen,
@@ -255,7 +257,19 @@ impl SourceModifications {
         analysis: &SourceAnalysis,
     ) -> Result<()> {
         let source_id = self.source_id;
+        let function_table = analysis.function_table();
         for step in &analysis.steps {
+            // Runtime hook probes in immutable functions (view/pure) are fragile and
+            // can alter control flow in optimizer-heavy code. Keep hooks focused on
+            // mutable execution paths.
+            let is_immutable_function = function_table
+                .get(&step.ufid())
+                .and_then(|func| func.state_mutability())
+                .is_some_and(|m| m == StateMutability::Pure || m == StateMutability::View);
+            if is_immutable_function {
+                continue;
+            }
+
             let usid = step.usid();
             let function_calls = step.function_calls();
             let loc = step.hook_locations().before_step;
@@ -287,7 +301,16 @@ impl SourceModifications {
         analysis: &SourceAnalysis,
     ) -> Result<()> {
         let source_id = self.source_id;
+        let function_table = analysis.function_table();
         for step in &analysis.steps {
+            let is_immutable_function = function_table
+                .get(&step.ufid())
+                .and_then(|func| func.state_mutability())
+                .is_some_and(|m| m == StateMutability::Pure || m == StateMutability::View);
+            if is_immutable_function {
+                continue;
+            }
+
             let updated_variables = step.updated_variables();
             let locs = step.hook_locations().after_step;
             for loc in locs {

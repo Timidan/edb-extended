@@ -29,9 +29,7 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 use edb_common::{
-    edb_debug_assert, edb_debug_assert_eq,
-    types::{ExecutionFrameId, Trace},
-    EdbContext, OpcodeTr,
+    edb_debug_assert, edb_debug_assert_eq, types::ExecutionFrameId, EdbContext, OpcodeTr,
 };
 use revm::{
     bytecode::opcode::OpCode,
@@ -51,7 +49,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use tracing::{debug, error};
+use tracing::debug;
 
 use crate::Stack;
 
@@ -63,6 +61,9 @@ where
     <CacheDB<DB> as Database>::Error: Clone,
     <DB as Database>::Error: Clone,
 {
+    /// Monotonic sequence index in global execution order
+    #[serde(default)]
+    pub global_index: usize,
     /// Program counter (instruction offset)
     pub pc: usize,
     /// Target address that triggered the hook
@@ -180,15 +181,12 @@ impl TraceState {
 
 /// Inspector that records detailed opcode execution snapshots
 #[derive(Debug)]
-pub struct OpcodeSnapshotInspector<'a, DB>
+pub struct OpcodeSnapshotInspector<DB>
 where
     DB: Database + DatabaseCommit + DatabaseRef + Clone,
     <CacheDB<DB> as Database>::Error: Clone,
     <DB as Database>::Error: Clone,
 {
-    /// The trace of the current tx
-    trace: &'a Trace,
-
     /// Map from execution frame ID to list of snapshots
     pub snapshots: OpcodeSnapshots<DB>,
 
@@ -215,18 +213,22 @@ where
 
     /// Last opcode
     last_opcode: Option<OpCode>,
+
+    /// Global snapshot counter for cross-frame ordering reconstruction
+    next_global_index: usize,
+    /// Keep only parity-critical opcodes when recording snapshots.
+    significant_only: bool,
 }
 
-impl<'a, DB> OpcodeSnapshotInspector<'a, DB>
+impl<DB> OpcodeSnapshotInspector<DB>
 where
     DB: Database + DatabaseCommit + DatabaseRef + Clone,
     <CacheDB<DB> as Database>::Error: Clone,
     <DB as Database>::Error: Clone,
 {
     /// Create a new opcode snapshot inspector
-    pub fn new(ctx: &EdbContext<DB>, trace: &'a Trace) -> Self {
+    pub fn new(ctx: &EdbContext<DB>) -> Self {
         Self {
-            trace,
             snapshots: OpcodeSnapshots::<DB>::default(),
             excluded_addresses: HashSet::new(),
             frame_stack: Vec::new(),
@@ -236,12 +238,19 @@ where
             database: Arc::new(ctx.db().clone()),
             transient_storage: Arc::new(TransientStorage::default()),
             last_opcode: None,
+            next_global_index: 0,
+            significant_only: false,
         }
     }
 
     /// Create inspector with excluded addresses
     pub fn with_excluded_addresses(&mut self, excluded_addresses: HashSet<Address>) {
         self.excluded_addresses = excluded_addresses;
+    }
+
+    /// Keep only significant opcodes when capturing snapshots.
+    pub fn with_significant_only(&mut self, significant_only: bool) {
+        self.significant_only = significant_only;
     }
 
     /// Consume the inspector and return the collected snapshots
@@ -262,6 +271,16 @@ where
     /// Check if we should record steps for the given address
     fn should_record(&self, address: Address) -> bool {
         !self.excluded_addresses.contains(&address)
+    }
+
+    fn is_significant_opcode(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            // control-flow and call lifecycle
+            0x00 | 0x56 | 0x57 | 0x5b | 0xf1 | 0xf2 | 0xf3 | 0xf4 | 0xfa |
+            // storage / logs / create / halt
+            0x54 | 0x55 | 0xa0..=0xa4 | 0xf0 | 0xf5 | 0xfd | 0xff
+        )
     }
 
     /// Update the persistent stack based on the interpreter's current stack
@@ -373,8 +392,12 @@ where
         if !self.should_record(contract_address) {
             return;
         }
+        if self.significant_only && !Self::is_significant_opcode(opcode.get()) {
+            return;
+        }
 
-        let address = interp.input.target_address();
+        let global_index = self.next_global_index;
+        self.next_global_index = self.next_global_index.saturating_add(1);
 
         // Get or create frame state
         let frame_state =
@@ -393,18 +416,28 @@ where
         let calldata = trace_state.last_calldata.clone();
 
         // Create snapshot (stack is always cloned as it changes frequently)
-        let entry = self.trace.get(frame_id.trace_entry_id());
+        let bytecode_address =
+            interp.input.bytecode_address().cloned().unwrap_or(interp.input.target_address());
+        let target_address = interp.input.target_address();
         let snapshot = OpcodeSnapshot {
+            global_index,
             pc: interp.bytecode.pc(),
-            bytecode_address: entry.map(|t| t.code_address).unwrap_or(address),
-            target_address: entry.map(|t| t.target).unwrap_or(address),
+            bytecode_address,
+            target_address,
             opcode: opcode.get(),
             memory,
-            stack: self
-                .trace_state
-                .get(&frame_id.trace_entry_id())
-                .map(|s| s.stack.clone())
-                .unwrap_or_default(),
+            stack: if self.significant_only {
+                let mut stack = Stack::new();
+                for value in interp.stack.data().iter().copied() {
+                    stack = stack.push(value);
+                }
+                stack
+            } else {
+                self.trace_state
+                    .get(&frame_id.trace_entry_id())
+                    .map(|s| s.stack.clone())
+                    .unwrap_or_default()
+            },
             calldata,
             database: self.database.clone(),
             transient_storage: self.transient_storage.clone(),
@@ -460,10 +493,11 @@ where
         self.frame_stack.clear();
         self.frame_states.clear();
         self.current_trace_id = 0;
+        self.next_global_index = 0;
     }
 }
 
-impl<'a, DB> Inspector<EdbContext<DB>> for OpcodeSnapshotInspector<'a, DB>
+impl<DB> Inspector<EdbContext<DB>> for OpcodeSnapshotInspector<DB>
 where
     DB: Database + DatabaseCommit + DatabaseRef + Clone,
     <CacheDB<DB> as Database>::Error: Clone,
@@ -477,7 +511,9 @@ where
     fn step_end(&mut self, interp: &mut Interpreter, context: &mut EdbContext<DB>) {
         // Record snapshot AFTER executing the opcode
         self.update_storage(context, false);
-        self.update_stack(interp, context);
+        if !self.significant_only {
+            self.update_stack(interp, context);
+        }
         self.update_memory(interp);
     }
 
@@ -500,23 +536,7 @@ where
         outcome: &mut CallOutcome,
     ) {
         // Stop tracking current execution frame
-        let Some(frame_id) = self.pop_frame() else { return };
-
-        let Some(entry) = self.trace.get(frame_id.trace_entry_id()) else { return };
-
-        edb_debug_assert_eq!(
-            entry.result,
-            Some(outcome.into()),
-            "Call outcome mismatch in frame {frame_id:?}: expected {:?}, got {outcome:?}",
-            entry.result
-        );
-        if entry.result != Some(outcome.into()) {
-            // Mismatch in expected outcome, log error
-            error!(
-                "Call outcome mismatch in frame {frame_id:?}: expected {:?}, got {outcome:?}",
-                entry.result
-            );
-        }
+        let Some(_frame_id) = self.pop_frame() else { return };
 
         // Update storage
         self.update_storage(context, true);
@@ -553,23 +573,7 @@ where
         outcome: &mut CreateOutcome,
     ) {
         // Stop tracking current execution frame
-        let Some(frame_id) = self.pop_frame() else { return };
-
-        let Some(entry) = self.trace.get(frame_id.trace_entry_id()) else { return };
-
-        edb_debug_assert_eq!(
-            entry.result,
-            Some(outcome.into()),
-            "Create outcome mismatch in frame {frame_id:?}: expected {:?}, got {outcome:?}",
-            entry.result
-        );
-        if entry.result != Some(outcome.into()) {
-            // Mismatch in expected outcome, log error
-            error!(
-                "Create outcome mismatch in frame {frame_id:?}: expected {:?}, got {outcome:?}",
-                entry.result
-            );
-        }
+        let Some(_frame_id) = self.pop_frame() else { return };
 
         // Update storage
         self.update_storage(context, true);

@@ -50,7 +50,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     analysis::{dyn_sol_type, AnalysisResult, UserDefinedTypeRef, VariableRef, UVID},
@@ -520,15 +520,24 @@ where
             match decode_variable_value(&analysis.user_defined_types, variable, decoded_data) {
                 Ok(v) => v,
                 Err(e) => {
-                    error!(
+                    let type_hint = variable
+                        .declaration()
+                        .type_descriptions
+                        .type_string
+                        .clone()
+                        .or_else(|| {
+                            variable.declaration().type_name.as_ref().map(|t| format!("{t:?}"))
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    warn!(
                         address=?address,
                         uvid=?uvid,
-                        variable=?variable.declaration().type_descriptions.type_string,
-                        type_name = ?variable.declaration().type_name,
-                        data=?hex::encode(decoded_data),
+                        variable=?variable.declaration().name,
+                        variable_type=?type_hint,
                         error=?e,
+                        "Failed to decode variable update; storing unresolved placeholder"
                     );
-                    return;
+                    DynSolValue::String(format!("<unresolved {}>", type_hint))
                 }
             };
 

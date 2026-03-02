@@ -39,7 +39,7 @@ pub fn capture_opcode_level_snapshots<DB>(
     ctx: EdbContext<DB>,
     tx: TxEnv,
     excluded_addresses: HashSet<Address>,
-    trace: &Trace,
+    significant_only: bool,
 ) -> Result<OpcodeSnapshots<DB>>
 where
     DB: Database + DatabaseCommit + DatabaseRef + Clone,
@@ -48,8 +48,9 @@ where
 {
     info!("Collecting opcode-level step execution results");
 
-    let mut inspector = OpcodeSnapshotInspector::new(&ctx, trace);
+    let mut inspector = OpcodeSnapshotInspector::new(&ctx);
     inspector.with_excluded_addresses(excluded_addresses);
+    inspector.with_significant_only(significant_only);
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     evm.inspect_one_tx(tx)

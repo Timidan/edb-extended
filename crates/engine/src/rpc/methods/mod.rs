@@ -25,6 +25,7 @@
 //! - `edb_getCode` - Retrieve contract bytecode
 //! - `edb_getConstructorArgs` - Get constructor arguments
 //! - `edb_getStorageLayout` - Get storage layout for struct field inspection
+//! - `edb_getArtifactsByAddresses` - Retrieve multiple artifacts in one call
 //!
 //! ## Expression Evaluation ([`expr`])
 //! - `edb_evalOnSnapshot` - Evaluate expressions against snapshots
@@ -44,9 +45,12 @@
 //! ## Storage Inspection ([`storage`])
 //! - `edb_getStorage` - Read contract storage at specific snapshot
 //! - `edb_getStorageDiff` - Compare storage between snapshots
+//! - `edb_getStorageTouched` - Get all SLOAD/SSTORE-touched slots across execution
+//! - `edb_getStorageRange` - Batch read all cached slots for an address
 //!
 //! ## Trace Analysis ([`trace`])
 //! - `edb_getTrace` - Get complete execution trace
+//! - `edb_getTraceLite` - Get bytecode-stripped execution trace for fast transport
 //!
 //! # Architecture
 //!
@@ -58,6 +62,7 @@ mod artifact;
 mod breakpoint;
 mod expr;
 mod navigation;
+mod rendered_trace;
 mod resolve;
 mod snapshot;
 mod storage;
@@ -108,10 +113,21 @@ where
 
         match method {
             "edb_getTrace" => trace::get_trace(&self.context),
+            "edb_getTraceLite" => trace::get_trace_lite(&self.context),
+            "edb_getRenderedTrace" => rendered_trace::get_rendered_trace(&self.context),
             "edb_getCode" => artifact::get_code(&self.context, params),
             "edb_getCodeByAddress" => artifact::get_code_by_address(&self.context, params),
             "edb_getConstructorArgs" => artifact::get_constructor_args(&self.context, params),
             "edb_getArtifactByAddress" => artifact::get_artifact_by_address(&self.context, params),
+            "edb_getArtifactsByAddresses" => {
+                artifact::get_artifacts_by_addresses(&self.context, params)
+            }
+            "edb_getRecompiledArtifactByAddress" => {
+                artifact::get_recompiled_artifact_by_address(&self.context, params)
+            }
+            "edb_getRecompiledArtifactsByAddresses" => {
+                artifact::get_recompiled_artifacts_by_addresses(&self.context, params)
+            }
             "edb_getStorageLayout" => artifact::get_storage_layout(&self.context, params),
             "edb_getSnapshotCount" => snapshot::get_snapshot_count(&self.context),
             "edb_getSnapshotInfo" => snapshot::get_snapshot_info(&self.context, params),
@@ -122,6 +138,8 @@ where
             "edb_getPrevCall" => navigation::get_prev_call(&self.context, params),
             "edb_getStorage" => storage::get_storage(&self.context, params),
             "edb_getStorageDiff" => storage::get_storage_diff(&self.context, params),
+            "edb_getStorageTouched" => storage::get_storage_touched(&self.context, params),
+            "edb_getStorageRange" => storage::get_storage_range(&self.context, params),
             "edb_evalOnSnapshot" => expr::eval_on_snapshot(&self.context, params),
             "edb_getBreakpointHits" => breakpoint::get_breakpoint_hits(&self.context, params),
             // Unimplemented methods

@@ -145,6 +145,7 @@ where
 
         let mut tx_env = TxEnvBuilder::new()
             .caller(self.tx.caller)
+            .chain_id(self.tx.chain_id)
             .call(to)
             .value(value)
             .data(Bytes::copy_from_slice(data))

@@ -30,10 +30,8 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_MAINNET_RPCS: &[&str] = &[
     "https://rpc.eth.gateway.fm",
     // "https://ethereum-rpc.publicnode.com", // disable due to publicnode's temporary issues
-    "https://mainnet.gateway.tenderly.co",
     // "https://rpc.flashbots.net/fast", // disable due to flashbots' temporary issues
     // "https://rpc.flashbots.net", // disable due to flashbots' temporary issues
-    "https://gateway.tenderly.co/public/mainnet",
     "https://eth-mainnet.public.blastapi.io",
     "https://ethereum-mainnet.gateway.tatum.io",
     "https://eth.api.onfinality.io/public",

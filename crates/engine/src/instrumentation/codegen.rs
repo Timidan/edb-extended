@@ -28,13 +28,17 @@ pub fn generate_step_hook(version: &VersionRef, usid: USID) -> Option<String> {
     // Solidity 0.4 does not support abi.encode, so we use a "0.4-compatible" way to encode the parameters.
     if **version < Version::parse("0.5.0").unwrap() {
         Some(format!(
-            "require(keccak256(uint256({}), uint256({})) != bytes32(uint256(0x2333)));",
+            // Include a runtime value (`gasleft()`) so optimizer cannot fold
+            // this hook into a compile-time constant and remove it.
+            "require(keccak256(uint256({}), uint256({}), uint256(gasleft())) != bytes32(uint256(0x2333)));",
             MAGIC_SNAPSHOT_NUMBER,
             u64::from(usid)
         ))
     } else {
         Some(format!(
-            "require(keccak256(abi.encode(uint256({}), uint256({}))) != bytes32(uint256(0x2333)));",
+            // Include a runtime value (`gasleft()`) so optimizer cannot fold
+            // this hook into a compile-time constant and remove it.
+            "require(keccak256(abi.encode(uint256({}), uint256({}), uint256(gasleft()))) != bytes32(uint256(0x2333)));",
             MAGIC_SNAPSHOT_NUMBER,
             u64::from(usid)
         ))

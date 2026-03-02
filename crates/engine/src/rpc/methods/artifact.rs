@@ -22,10 +22,12 @@ use std::sync::Arc;
 use alloy_primitives::{Address, Bytes};
 use edb_common::types::{Code, OpcodeInfo, SourceInfo};
 use revm::{database::CacheDB, Database, DatabaseCommit, DatabaseRef};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::debug;
 
-use crate::{error_codes, utils::disasm::disassemble, utils::Artifact, EngineContext, SnapshotDetail};
+use crate::{
+    error_codes, utils::disasm::disassemble, utils::Artifact, EngineContext, SnapshotDetail,
+};
 
 use super::super::types::RpcError;
 
@@ -225,6 +227,123 @@ where
     Ok(json_value)
 }
 
+/// Get full artifacts (metadata + sources + source maps) for multiple contract addresses.
+///
+/// # Parameters
+/// - `addresses`: Array of contract addresses, wrapped as first RPC param
+///   - Expected JSON-RPC shape: `[[address1, address2, ...]]`
+///
+/// # Returns
+/// - JSON object keyed by lowercase address containing artifact JSON for each hit.
+///   Missing addresses are skipped.
+pub fn get_artifacts_by_addresses<DB>(
+    context: &Arc<EngineContext<DB>>,
+    params: Option<Value>,
+) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let addresses = parse_address_list_param(params)?;
+    let mut artifacts = Map::with_capacity(addresses.len());
+
+    for address in addresses {
+        let Some(artifact) = context.artifacts.get(&address) else {
+            continue;
+        };
+
+        let json_value = serde_json::to_value(artifact).map_err(|e| RpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: format!("Failed to serialize artifact: {e}"),
+            data: None,
+        })?;
+
+        artifacts.insert(address.to_string().to_lowercase(), json_value);
+    }
+
+    debug!("Retrieved {} artifacts in bulk", artifacts.len());
+    Ok(Value::Object(artifacts))
+}
+
+/// Get full recompiled (instrumented) artifact for a contract address.
+/// Recompiled artifacts have source maps that match instrumented bytecode PCs,
+/// which is required for correct opcode-to-line mapping in Diamond/DELEGATECALL scenarios.
+pub fn get_recompiled_artifact_by_address<DB>(
+    context: &Arc<EngineContext<DB>>,
+    params: Option<Value>,
+) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let address: Address = params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Invalid params: expected [address]".to_string(),
+            data: None,
+        })?;
+
+    let artifact = context.recompiled_artifacts.get(&address).ok_or_else(|| RpcError {
+        code: error_codes::INVALID_ADDRESS,
+        message: format!("No recompiled artifact found for address {address}"),
+        data: None,
+    })?;
+
+    let json_value = serde_json::to_value(artifact).map_err(|e| RpcError {
+        code: error_codes::INTERNAL_ERROR,
+        message: format!("Failed to serialize recompiled artifact: {e}"),
+        data: None,
+    })?;
+
+    debug!("Retrieved recompiled artifact for address {}", address);
+    Ok(json_value)
+}
+
+/// Get full recompiled artifacts for multiple contract addresses.
+///
+/// # Parameters
+/// - `addresses`: Array of contract addresses, wrapped as first RPC param
+///   - Expected JSON-RPC shape: `[[address1, address2, ...]]`
+///
+/// # Returns
+/// - JSON object keyed by lowercase address containing recompiled artifact JSON for each hit.
+///   Missing addresses are skipped.
+pub fn get_recompiled_artifacts_by_addresses<DB>(
+    context: &Arc<EngineContext<DB>>,
+    params: Option<Value>,
+) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let addresses = parse_address_list_param(params)?;
+    let mut artifacts = Map::with_capacity(addresses.len());
+
+    for address in addresses {
+        let Some(artifact) = context.recompiled_artifacts.get(&address) else {
+            continue;
+        };
+
+        let json_value = serde_json::to_value(artifact).map_err(|e| RpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: format!("Failed to serialize recompiled artifact: {e}"),
+            data: None,
+        })?;
+
+        artifacts.insert(address.to_string().to_lowercase(), json_value);
+    }
+
+    debug!("Retrieved {} recompiled artifacts in bulk", artifacts.len());
+    Ok(Value::Object(artifacts))
+}
+
 /// Get constructor arguments for a contract at a specific address
 ///
 /// This method retrieves the constructor arguments used during the deployment
@@ -381,4 +500,30 @@ fn get_disassembled_code(bytecode: &Bytes) -> HashMap<usize, String> {
         codes.insert(pc, opcode_str);
     }
     codes
+}
+
+fn parse_address_list_param(params: Option<Value>) -> Result<Vec<Address>, RpcError> {
+    let raw_addresses = params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Invalid params: expected [[address1, address2, ...]]".to_string(),
+            data: None,
+        })?;
+
+    let mut addresses = Vec::with_capacity(raw_addresses.len());
+    for raw_address in raw_addresses {
+        let address: Address =
+            serde_json::from_value(raw_address.clone()).map_err(|_| RpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: "Invalid params: expected [[address1, address2, ...]]".to_string(),
+                data: None,
+            })?;
+        addresses.push(address);
+    }
+
+    Ok(addresses)
 }

@@ -32,5 +32,8 @@ pub use trace::*;
 mod execution_frame;
 pub use execution_frame::*;
 
+mod rendered_trace;
+pub use rendered_trace::*;
+
 mod sol_value;
 pub use sol_value::*;

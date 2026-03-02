@@ -308,6 +308,7 @@ pub struct TraceEntry {
     /// Create scheme for contract creation
     pub create_scheme: Option<CreateScheme>,
     /// The underlying running bytecode
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bytecode: Option<Bytes>,
     /// Label of the target contract
     pub target_label: Option<String>,

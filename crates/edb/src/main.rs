@@ -20,12 +20,9 @@
 
 use std::env;
 
-use alloy_primitives::TxHash;
 use clap::{Parser, Subcommand};
 use edb_engine::EngineConfig;
 use eyre::Result;
-
-use crate::utils::TuiOptions;
 
 mod cmd;
 mod proxy;
@@ -66,25 +63,12 @@ pub struct Cli {
     #[arg(long, env = edb_common::env::EDB_CACHE_DIR)]
     pub cache_dir: Option<String>,
 
-    /// TUI-specific options
-    #[command(flatten)]
-    pub tui_options: TuiOptions,
-
     /// Command to execute
     #[command(subcommand)]
     pub command: Commands,
 }
 
 impl Cli {
-    /// Validate CLI arguments and warn about misused options
-    pub fn validate(&self) {
-        // Warn if TUI options are used with non-TUI mode
-        if !self.command.enables_tui() && self.tui_options.disable_mouse {
-            tracing::warn!("--disable-mouse flag has no effect when not using TUI");
-            eprintln!("Warning: --disable-mouse flag has no effect when not using TUI");
-        }
-    }
-
     /// Derive EDB engine configuration from CLI arguments
     pub fn to_engine_config(&self, rpc_url: &str) -> EngineConfig {
         let mut engine_config = EngineConfig::default()
@@ -100,11 +84,6 @@ impl Cli {
 /// Available commands
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Replay an existing transaction
-    Replay {
-        /// Transaction hash to replay
-        tx_hash: String,
-    },
     /// Debug a Foundry test case
     Test {
         /// Test name to debug
@@ -123,13 +102,6 @@ pub enum Commands {
     ProxyStatus,
 }
 
-impl Commands {
-    /// Whether the command enables a TUI
-    pub fn enables_tui(&self) -> bool {
-        matches!(self, Self::Replay { .. } | Self::Test { .. })
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load environment variables
@@ -140,9 +112,6 @@ async fn main() -> Result<()> {
 
     // Parse CLI arguments
     let cli = Cli::parse();
-
-    // Validate CLI arguments
-    cli.validate();
 
     if let Some(cache_dir) = &cli.cache_dir {
         tracing::info!("Using cache directory: {cache_dir}");
@@ -160,11 +129,6 @@ async fn main() -> Result<()> {
 
     // Execute the command to get RPC server handle
     match &cli.command {
-        Commands::Replay { tx_hash } => {
-            tracing::info!("Replaying transaction: {}", tx_hash);
-            let tx_hash: TxHash = tx_hash.parse()?;
-            cmd::replay_transaction(tx_hash, &cli, &effective_rpc_url).await
-        }
         Commands::Test { test_name, block } => {
             tracing::info!("Debugging test: {}", test_name);
             cmd::debug_foundry_test(test_name, *block, &cli, &effective_rpc_url).await

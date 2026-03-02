@@ -58,8 +58,9 @@ use edb_common::{
     fork_and_prepare, relax_evm_constraints, Cache, CachePath, EdbCache, EdbCachePath, EdbContext,
     ForkResult,
 };
-use eyre::Result;
+use eyre::{eyre, Result};
 use foundry_block_explorers::{contract::ContractCreationData, Client};
+use foundry_compilers::{artifacts::Contract, Artifact as _};
 use revm::{
     context::{Cfg, ContextTr},
     database::CacheDB,
@@ -118,6 +119,9 @@ where
     <CacheDB<DB> as Database>::Error: Clone,
     <DB as Database>::Error: Clone,
 {
+    const MIN_RUNTIME_PREFIX_RATIO: f64 = 0.45;
+    const MIN_RUNTIME_PREFIX_BYTES: usize = 64;
+
     /// Creates a new `CodeTweaker` instance.
     ///
     /// # Arguments
@@ -161,10 +165,15 @@ where
         let tweak_start = Instant::now();
         let tweaked_code =
             self.get_tweaked_code(addr, artifact, recompiled_artifact, quick).await?;
-        info!("[TIMING] Contract {} get_tweaked_code: {:.2}s", addr, tweak_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Contract {} get_tweaked_code: {:.2}s",
+            addr,
+            tweak_start.elapsed().as_secs_f64()
+        );
 
         if tweaked_code.is_empty() {
             error!(addr=?addr, quick=?quick, "Tweaked code is empty");
+            return Err(eyre!("tweaked bytecode is empty (addr={}, quick={})", addr, quick));
         }
 
         let db = self.ctx.db_mut();
@@ -189,7 +198,7 @@ where
     /// 3. Using the TweakInspector to intercept and modify the deployment
     /// 4. Extracting the resulting runtime bytecode
     async fn get_tweaked_code(
-        &self,
+        &mut self,
         addr: &Address,
         artifact: &Artifact,
         recompiled_artifact: &Artifact,
@@ -197,21 +206,220 @@ where
     ) -> Result<Bytes> {
         let creation_tx_start = Instant::now();
         let creation_tx_hash = self.get_creation_tx(addr).await?;
-        info!("[TIMING] Contract {} get_creation_tx: {:.2}s", addr, creation_tx_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Contract {} get_creation_tx: {:.2}s",
+            addr,
+            creation_tx_start.elapsed().as_secs_f64()
+        );
         debug!("Creation tx: {} -> {}", creation_tx_hash, addr);
 
         // Create replay environment
         let fork_start = Instant::now();
         let ForkResult { context: mut replay_ctx, target_tx_env: mut creation_tx_env, .. } =
             fork_and_prepare(&self.rpc_url, creation_tx_hash, quick).await?;
-        info!("[TIMING] Contract {} fork_and_prepare (creation tx): {:.2}s", addr, fork_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Contract {} fork_and_prepare (creation tx): {:.2}s",
+            addr,
+            fork_start.elapsed().as_secs_f64()
+        );
         relax_evm_constraints(&mut replay_ctx, &mut creation_tx_env);
 
-        // Get init code
-        let contract = artifact.contract().ok_or(eyre::eyre!("Failed to get contract"))?;
+        // Select the best-matching contract pair for this address.
+        // Artifacts can include multiple contracts per file; selecting by largest init bytecode
+        // alone can pick the wrong contract and cause hook replay divergence.
+        let runtime_bytecode = self.get_runtime_bytecode(addr);
+        let runtime_for_match = runtime_bytecode.as_deref();
+        let runtime_len = runtime_for_match.map(|bytes| bytes.len());
+        let preferred_name = artifact.contract_name();
 
-        let recompiled_contract =
-            recompiled_artifact.contract().ok_or(eyre::eyre!("Failed to get contract"))?;
+        #[derive(Clone)]
+        struct OriginalCandidate<'b> {
+            original: &'b Contract,
+            path: &'b std::path::Path,
+            file_path: String,
+            contract_name: String,
+            original_creation_len: usize,
+            deployed_len: usize,
+            runtime_prefix_len: usize,
+            preferred_name: bool,
+        }
+
+        // Recompiled artifacts can normalize source paths differently from originals.
+        // Resolve by exact path+name first, then fallback to best same-name contract.
+        let resolve_recompiled_contract =
+            |path: &std::path::Path, name: &str| -> Option<&Contract> {
+                if let Some(contract) =
+                    recompiled_artifact.output.contracts.get(path).and_then(|c| c.get(name))
+                {
+                    return Some(contract);
+                }
+
+                let mut best: Option<&Contract> = None;
+                let mut best_creation_len = 0usize;
+                for contracts in recompiled_artifact.output.contracts.values() {
+                    let Some(contract) = contracts.get(name) else { continue };
+                    let creation_len =
+                        contract.get_bytecode_bytes().map(|bytes| bytes.len()).unwrap_or(0);
+                    if best.is_none() || creation_len > best_creation_len {
+                        best = Some(contract);
+                        best_creation_len = creation_len;
+                    }
+                }
+                best
+            };
+
+        let mut candidates: Vec<OriginalCandidate<'_>> = Vec::new();
+        for (path, contracts) in &artifact.output.contracts {
+            for (name, original_contract) in contracts {
+                let original_creation_len =
+                    original_contract.get_bytecode_bytes().map(|bytes| bytes.len()).unwrap_or(0);
+
+                let deployed_len = original_contract
+                    .evm
+                    .as_ref()
+                    .and_then(|evm| evm.deployed_bytecode.as_ref())
+                    .and_then(|deployed| deployed.bytes())
+                    .map(|bytes| bytes.len())
+                    .unwrap_or(0);
+                let runtime_prefix_len = if let Some(runtime) = runtime_for_match {
+                    original_contract
+                        .evm
+                        .as_ref()
+                        .and_then(|evm| evm.deployed_bytecode.as_ref())
+                        .and_then(|deployed| deployed.bytes())
+                        .map(|deployed| Self::common_prefix_len(runtime, deployed.as_ref()))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                if runtime_for_match.is_some() && deployed_len == 0 {
+                    continue;
+                }
+
+                candidates.push(OriginalCandidate {
+                    original: original_contract,
+                    path,
+                    file_path: path.display().to_string(),
+                    contract_name: name.clone(),
+                    original_creation_len,
+                    deployed_len,
+                    runtime_prefix_len,
+                    preferred_name: !preferred_name.is_empty() && name == preferred_name,
+                });
+            }
+        }
+
+        let mut selected = candidates
+            .iter()
+            .max_by(|a, b| {
+                // Runtime-first tie-breaker for multi-contract artifacts.
+                b.runtime_prefix_len
+                    .cmp(&a.runtime_prefix_len)
+                    .then_with(|| b.preferred_name.cmp(&a.preferred_name))
+                    .then_with(|| b.deployed_len.cmp(&a.deployed_len))
+                    .then_with(|| b.original_creation_len.cmp(&a.original_creation_len))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                let available_original_names: Vec<String> = artifact
+                    .output
+                    .contracts
+                    .values()
+                    .flat_map(|contracts| contracts.keys().cloned())
+                    .collect();
+                eyre!(
+                    "no eligible original contract candidates for {} (preferred='{}', available={:?})",
+                    addr,
+                    preferred_name,
+                    available_original_names
+                )
+            })?;
+
+        // If runtime matching is weak/absent, prefer explicit metadata contract-name match.
+        if let Some(runtime_len) = runtime_len {
+            let compare_len = runtime_len.min(selected.deployed_len);
+            let runtime_confident =
+                Self::is_runtime_match_confident(selected.runtime_prefix_len, compare_len);
+            if !runtime_confident && !selected.preferred_name {
+                if let Some(preferred) = candidates
+                    .iter()
+                    .filter(|candidate| candidate.preferred_name)
+                    .max_by(|a, b| {
+                        b.runtime_prefix_len
+                            .cmp(&a.runtime_prefix_len)
+                            .then_with(|| b.deployed_len.cmp(&a.deployed_len))
+                            .then_with(|| b.original_creation_len.cmp(&a.original_creation_len))
+                    })
+                    .cloned()
+                {
+                    selected = preferred;
+                }
+            }
+        } else if !selected.preferred_name && !preferred_name.is_empty() {
+            if let Some(preferred) = candidates
+                .iter()
+                .filter(|candidate| candidate.preferred_name)
+                .max_by(|a, b| {
+                    b.original_creation_len
+                        .cmp(&a.original_creation_len)
+                        .then_with(|| b.deployed_len.cmp(&a.deployed_len))
+                })
+                .cloned()
+            {
+                selected = preferred;
+            }
+        }
+
+        if runtime_for_match.is_some() && selected.runtime_prefix_len == 0 {
+            return Err(eyre!(
+                "no runtime-compatible creation-hook contract for {} (preferred='{}', selected='{}', file='{}')",
+                addr,
+                preferred_name,
+                selected.contract_name,
+                selected.file_path
+            ));
+        }
+
+        let recompiled_contract = resolve_recompiled_contract(selected.path, &selected.contract_name)
+            .ok_or_else(|| {
+                let available_recompiled_names: Vec<String> = recompiled_artifact
+                    .output
+                    .contracts
+                    .values()
+                    .flat_map(|contracts| contracts.keys().cloned())
+                    .collect();
+                eyre!(
+                    "no recompiled contract found for selected original {}:{} (available recompiled contracts={:?})",
+                    selected.file_path,
+                    selected.contract_name,
+                    available_recompiled_names
+                )
+            })?;
+        let recompiled_creation_len =
+            recompiled_contract.get_bytecode_bytes().map(|bytes| bytes.len()).unwrap_or(0);
+        if recompiled_creation_len == 0 {
+            return Err(eyre!(
+                "selected recompiled contract {}:{} has empty creation bytecode",
+                selected.file_path,
+                selected.contract_name
+            ));
+        }
+
+        info!(
+            target_address = %addr,
+            selected_contract = %selected.contract_name,
+            selected_file = %selected.file_path,
+            selected_original_creation_len = selected.original_creation_len,
+            selected_recompiled_creation_len = recompiled_creation_len,
+            selected_deployed_len = selected.deployed_len,
+            selected_runtime_prefix_len = selected.runtime_prefix_len,
+            runtime_len = ?runtime_len,
+            preferred_contract_name = preferred_name,
+            selected_preferred_name = selected.preferred_name,
+            "Selected creation-hook contract pair"
+        );
+
+        let contract = selected.original;
 
         let constructor_args = recompiled_artifact.constructor_arguments();
 
@@ -223,9 +431,48 @@ where
         let inspect_start = Instant::now();
         evm.inspect_one_tx(creation_tx_env)
             .map_err(|e| eyre::eyre!("Failed to inspect the target transaction: {:?}", e))?;
-        info!("[TIMING] Contract {} inspect_one_tx (creation replay): {:.2}s", addr, inspect_start.elapsed().as_secs_f64());
+        info!(
+            "[TIMING] Contract {} inspect_one_tx (creation replay): {:.2}s",
+            addr,
+            inspect_start.elapsed().as_secs_f64()
+        );
 
         inspector.into_deployed_code()
+    }
+
+    fn get_runtime_bytecode(&mut self, addr: &Address) -> Option<Vec<u8>> {
+        let db = self.ctx.db_mut();
+        let account = db.basic(*addr).ok().flatten()?;
+        if let Some(code) = account.code {
+            let bytes = code.original_bytes();
+            if !bytes.is_empty() {
+                return Some(bytes.to_vec());
+            }
+        }
+        if account.code_hash == KECCAK_EMPTY {
+            return None;
+        }
+        db.code_by_hash(account.code_hash)
+            .ok()
+            .map(|bytecode| bytecode.original_bytes().to_vec())
+            .filter(|bytes| !bytes.is_empty())
+    }
+
+    #[inline]
+    fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(lhs, rhs)| lhs == rhs).count()
+    }
+
+    #[inline]
+    fn is_runtime_match_confident(prefix_len: usize, compare_len: usize) -> bool {
+        if compare_len == 0 {
+            return false;
+        }
+        let required_prefix = Self::MIN_RUNTIME_PREFIX_BYTES.min(compare_len);
+        if prefix_len < required_prefix {
+            return false;
+        }
+        (prefix_len as f64 / compare_len as f64) >= Self::MIN_RUNTIME_PREFIX_RATIO
     }
 
     /// Retrieves the transaction hash that created a contract at the given address.
@@ -262,9 +509,8 @@ where
             // instead of V2 unified API which requires Pro-tier API key for multi-chain.
             // The alloy-chains library incorrectly maps some chains (Base, Fraxtal, etc.)
             // to the V2 API, so we need to override those here.
-            let mut builder = Client::builder()
-                .with_api_key(etherscan_api_key)
-                .chain(chain_id.into())?;
+            let mut builder =
+                Client::builder().with_api_key(etherscan_api_key).chain(chain_id.into())?;
 
             // Override API URL for chains that have migrated to Etherscan V2 unified API
             // (chain-native APIs like api.basescan.org are deprecated and no longer work)

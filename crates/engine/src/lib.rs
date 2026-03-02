@@ -122,5 +122,7 @@ pub use snapshot::*;
 pub mod tweak;
 pub use tweak::*;
 
+pub mod trace_render;
+
 pub mod utils;
 pub use utils::*;

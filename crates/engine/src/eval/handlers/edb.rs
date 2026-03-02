@@ -53,8 +53,8 @@ use alloy_primitives::{Address, U256};
 use edb_common::types::{parse_callable_abi_entries, CallableAbiEntry, TraceEntry};
 use eyre::{bail, eyre, Result};
 use foundry_compilers::artifacts::StorageLayout;
-use serde_json;
 use revm::{database::CacheDB, Database, DatabaseCommit, DatabaseRef};
+use serde_json;
 use tracing::debug;
 
 use super::*;
@@ -87,6 +87,31 @@ fn into_abi_info(value: &DynSolValue) -> Option<CallableAbiEntry> {
     None
 }
 
+/// Read a storage slot from snapshot DB, using cache first and DB-ref fallback.
+fn read_storage_slot_from_snapshot<DB>(
+    snapshot: &Snapshot<DB>,
+    target_address: Address,
+    slot: U256,
+) -> Option<U256>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let db = snapshot.db();
+    if let Some(value) = db
+        .cache
+        .accounts
+        .get(&target_address)
+        .and_then(|account| account.storage.get(&slot))
+        .cloned()
+    {
+        return Some(value);
+    }
+
+    db.storage_ref(target_address, slot).ok()
+}
+
 /// Read a struct variable from storage by reading all its fields.
 ///
 /// This function uses the storage layout's type information to find all struct
@@ -105,16 +130,21 @@ where
 {
     let type_info = storage_layout.types.get(type_key)?;
 
-    // Get struct members from the "members" field in the type's "other" map
-    let members_value = type_info.other.get("members")?;
-    let members: Vec<serde_json::Value> = serde_json::from_value(members_value.clone()).ok()?;
+    // Foundry storage-layout JSON can encode struct members either in
+    // `type_info.other.members` or at top-level `type_info.members`.
+    let members_value = type_info.other.get("members").cloned().or_else(|| {
+        serde_json::to_value(type_info).ok().and_then(|value| {
+            value
+                .get("members")
+                .cloned()
+                .or_else(|| value.get("other").and_then(|other| other.get("members")).cloned())
+        })
+    })?;
+    let members: Vec<serde_json::Value> = serde_json::from_value(members_value).ok()?;
 
     if members.is_empty() {
         return None;
     }
-
-    let db = snapshot.db();
-    let account = db.cache.accounts.get(&target_address)?;
 
     let mut field_values: Vec<(String, DynSolValue)> = Vec::new();
 
@@ -133,9 +163,6 @@ where
         let relative_slot: U256 = slot_str.parse().ok()?;
         let actual_slot = base_slot + relative_slot;
 
-        // Read storage value
-        let raw_value = account.storage.get(&actual_slot).cloned().unwrap_or_default();
-
         // Decode the field value
         let field_value = if member_type_label.starts_with("struct ") {
             // Recursively handle nested structs
@@ -145,14 +172,23 @@ where
                 storage_layout,
                 target_address,
                 snapshot,
-            )?
+            )
+            .unwrap_or_else(|| DynSolValue::String(format!("<{}>", member_type_label)))
         } else if member_type_label.starts_with("mapping(") || member_type_label.ends_with("[]") {
             // For mappings and dynamic arrays, we can't read all values
             // Return a placeholder indicating the type
             DynSolValue::String(format!("<{}>", member_type_label))
+        } else if !is_direct_storage_decodable_type(member_type_label) {
+            // Unsupported/non-primitive member kinds (e.g. string/bytes) are exposed as placeholders.
+            // Skip slot reads for these to avoid expensive DB fetches with no decode benefit.
+            DynSolValue::String(format!("<{}>", member_type_label))
         } else {
-            // Elementary type - decode directly
-            decode_storage_value(member_type_label, raw_value, offset, n_bytes)?
+            let raw_value = read_storage_slot_from_snapshot(snapshot, target_address, actual_slot)
+                .unwrap_or_default();
+            // Elementary type - decode directly, but fail-soft per field so one
+            // unsupported member does not make the entire struct unreadable.
+            decode_storage_value(member_type_label, raw_value, offset, n_bytes)
+                .unwrap_or_else(|| DynSolValue::String(format!("<{}>", member_type_label)))
         };
 
         field_values.push((label.to_string(), field_value));
@@ -170,11 +206,7 @@ where
 
     // Create a custom struct value using the sol! macro format
     // DynSolValue doesn't have a native CustomStruct variant, so we encode as a named tuple
-    Some(DynSolValue::CustomStruct {
-        name: struct_name.to_string(),
-        prop_names,
-        tuple: values,
-    })
+    Some(DynSolValue::CustomStruct { name: struct_name.to_string(), prop_names, tuple: values })
 }
 
 /// Try to read a state variable value from storage layout.
@@ -230,21 +262,22 @@ where
     }
 
     // Read the storage slot
-    let db = snapshot.db();
-    let raw_value = db
-        .cache
-        .accounts
-        .get(&target_address)?
-        .storage
-        .get(&slot)
-        .cloned()
-        .unwrap_or_default();
+    let raw_value =
+        read_storage_slot_from_snapshot(snapshot, target_address, slot).unwrap_or_default();
 
     // Decode based on type
     let offset = storage_entry.offset as usize;
     let n_bytes: usize = type_info.number_of_bytes.parse().ok()?;
 
     decode_storage_value(type_label, raw_value, offset, n_bytes)
+}
+
+fn is_direct_storage_decodable_type(type_label: &str) -> bool {
+    type_label == "address"
+        || type_label == "bool"
+        || type_label.starts_with("uint")
+        || type_label.starts_with("int")
+        || (type_label.starts_with("bytes") && type_label != "bytes" && !type_label.ends_with("[]"))
 }
 
 /// Decode a raw storage value to a DynSolValue based on its type.
@@ -267,9 +300,7 @@ fn decode_storage_value(
     match type_label {
         "address" => {
             if n_bytes >= 20 {
-                let addr_bytes: [u8; 20] = extracted[extracted.len() - 20..]
-                    .try_into()
-                    .ok()?;
+                let addr_bytes: [u8; 20] = extracted[extracted.len() - 20..].try_into().ok()?;
                 Some(DynSolValue::Address(Address::from(addr_bytes)))
             } else {
                 None
@@ -491,24 +522,63 @@ where
         // For opcode snapshots, try storage layout for primitive state variables
         if let SnapshotDetail::Opcode(_) = snapshot.detail() {
             // Try to read primitive state variables from storage layout
-            if let Some(artifact) = self.0.context.recompiled_artifacts.get(&bytecode_address) {
-                if let Some(storage_layout) = artifact.storage_layout() {
-                    if let Some(value) = read_variable_from_storage_layout(
-                        name,
-                        storage_layout,
-                        target_address,
-                        snapshot,
-                    ) {
-                        debug!(
-                            "Read state variable '{}' from storage layout on opcode snapshot",
-                            name
-                        );
-                        return Ok(value);
+            let storage_layout = self
+                .0
+                .context
+                .recompiled_artifacts
+                .get(&bytecode_address)
+                .and_then(|artifact| artifact.storage_layout())
+                .or_else(|| {
+                    self.0
+                        .context
+                        .artifacts
+                        .get(&bytecode_address)
+                        .and_then(|artifact| artifact.storage_layout())
+                });
+            if let Some(storage_layout) = storage_layout {
+                if let Some(value) = read_variable_from_storage_layout(
+                    name,
+                    storage_layout,
+                    target_address,
+                    snapshot,
+                ) {
+                    debug!("Read state variable '{}' from storage layout on opcode snapshot", name);
+                    return Ok(value);
+                }
+            }
+            // Fall back to ABI-backed getter calls for state variables.
+            // This enables evaluating struct/tuple state vars directly from opcode snapshots.
+            let contract = self
+                .0
+                .context
+                .recompiled_artifacts
+                .get(&bytecode_address)
+                .and_then(|art| art.contract())
+                .or_else(|| {
+                    self.0.context.artifacts.get(&bytecode_address).and_then(|art| art.contract())
+                });
+            if let Some(contract) = contract {
+                for entry in parse_callable_abi_entries(contract) {
+                    if entry.name == name && entry.is_state_variable() {
+                        if entry.inputs.is_empty() {
+                            if let Ok(value) = self.0.context.call_in_derived_evm(
+                                snapshot_id,
+                                target_address,
+                                &entry.abi,
+                                &[],
+                                None,
+                            ) {
+                                return Ok(value);
+                            }
+                        } else if let Some(value) = from_abi_info(&entry) {
+                            // Keep placeholder path for mappings/arrays that require indices.
+                            return Ok(value);
+                        }
                     }
                 }
             }
-            // For complex types and local variables, opcode snapshots can't help
-            bail!("Cannot get variable value from opcode snapshot (except this and primitive state variables)");
+            // For locals and unresolved values, opcode snapshots can't help.
+            bail!("Cannot get variable value from opcode snapshot (except this and resolvable state variables)");
         }
 
         // Hook snapshot handling (original behavior)
@@ -522,6 +592,31 @@ where
         {
             return Ok((**value).clone().into());
         }
+        if detail.locals.get(name).is_some_and(|value| value.is_none()) {
+            return Ok(DynSolValue::String(format!("<unresolved local variable '{}'>", name)));
+        }
+
+        // Resolve private/internal state variables through storage layout as a fallback.
+        let storage_layout = self
+            .0
+            .context
+            .recompiled_artifacts
+            .get(&bytecode_address)
+            .and_then(|artifact| artifact.storage_layout())
+            .or_else(|| {
+                self.0
+                    .context
+                    .artifacts
+                    .get(&bytecode_address)
+                    .and_then(|artifact| artifact.storage_layout())
+            });
+        if let Some(storage_layout) = storage_layout {
+            if let Some(value) =
+                read_variable_from_storage_layout(name, storage_layout, target_address, snapshot)
+            {
+                return Ok(value);
+            }
+        }
 
         // Next, it might be a mapping/array variable
         let Some(contract) = self
@@ -530,16 +625,33 @@ where
             .recompiled_artifacts
             .get(&bytecode_address)
             .and_then(|art| art.contract())
+            .or_else(|| {
+                self.0.context.artifacts.get(&bytecode_address).and_then(|art| art.contract())
+            })
         else {
             bail!("No contract found for bytecode address {:?}", bytecode_address);
         };
 
         for entry in parse_callable_abi_entries(contract) {
             if entry.name == name && entry.is_state_variable() {
-                if let Some(value) = from_abi_info(&entry) {
+                if entry.inputs.is_empty() {
+                    if let Ok(value) = self.0.context.call_in_derived_evm(
+                        snapshot_id,
+                        target_address,
+                        &entry.abi,
+                        &[],
+                        None,
+                    ) {
+                        return Ok(value);
+                    }
+                } else if let Some(value) = from_abi_info(&entry) {
                     return Ok(value);
                 }
             }
+        }
+
+        if detail.state_variables.get(name).is_some_and(|value| value.is_none()) {
+            return Ok(DynSolValue::String(format!("<unresolved state variable '{}'>", name)));
         }
 
         bail!("No value found for name='{}', snapshot_id={}", name, snapshot_id)

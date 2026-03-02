@@ -198,7 +198,8 @@ pub fn dyn_sol_type(
                     for field in definition.members.iter() {
                         prop_names.push(field.name.clone());
                         // Handle None gracefully instead of panicking
-                        let sol_type = dyn_sol_type(all_user_defined_types, field.type_name.as_ref()?)?;
+                        let sol_type =
+                            dyn_sol_type(all_user_defined_types, field.type_name.as_ref()?)?;
                         prop_types.push(sol_type);
                     }
                     Some(DynSolType::CustomStruct {

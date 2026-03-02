@@ -30,3 +30,20 @@ where
     let trace = &context.trace;
     Ok(serde_json::json!(trace))
 }
+
+/// Get a transport-optimized trace with per-entry bytecode stripped.
+///
+/// Used by non-debug local simulation responses where rendered trace rows are already
+/// available and frontend no longer needs raw bytecode blobs in `rawTrace.inner`.
+pub fn get_trace_lite<DB>(context: &Arc<EngineContext<DB>>) -> Result<serde_json::Value, RpcError>
+where
+    DB: Database + DatabaseCommit + DatabaseRef + Clone + Send + Sync + 'static,
+    <CacheDB<DB> as Database>::Error: Clone + Send + Sync,
+    <DB as Database>::Error: Clone + Send + Sync,
+{
+    let mut trace = context.trace.clone();
+    for entry in trace.iter_mut() {
+        entry.bytecode = None;
+    }
+    Ok(serde_json::json!(trace))
+}

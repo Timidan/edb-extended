@@ -150,8 +150,21 @@ pub async fn fork_and_prepare(
         Err(full_error) => {
             // L2 chains may have special transaction types (e.g., type 0x7e deposits on Base/OP)
             // that can't be deserialized. Fall back to header-only fetch.
+            let raw_error_text = full_error.to_string();
+            let mut error_text = raw_error_text
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .unwrap_or("unknown full block fetch error")
+                .to_string();
+            const MAX_FORK_ERROR_LOG_CHARS: usize = 240;
+            if error_text.len() > MAX_FORK_ERROR_LOG_CHARS {
+                error_text.truncate(MAX_FORK_ERROR_LOG_CHARS);
+                error_text.push_str("...");
+            }
             warn!(
-                "Failed to fetch block with full transactions: {full_error}. \
+                "Failed to fetch block with full transactions: {error_text}. \
                  Falling back to header-only fetch (quick mode will be forced)."
             );
             let fallback_block = provider
@@ -238,7 +251,10 @@ pub async fn fork_and_prepare(
                 ))
             } else {
                 block.header.excess_blob_gas.map(|g| {
-                    BlobExcessGasAndPrice::new(g, get_blob_base_fee_update_fraction_by_spec_id(spec_id))
+                    BlobExcessGasAndPrice::new(
+                        g,
+                        get_blob_base_fee_update_fraction_by_spec_id(spec_id),
+                    )
                 })
             };
             b.beneficiary = block.header.beneficiary;

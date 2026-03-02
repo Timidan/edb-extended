@@ -318,6 +318,40 @@ where
     ) -> Self {
         let mut inner = Vec::new();
 
+        // Fast-path: no hook snapshots captured (non-debug simulation).
+        // Preserve true execution order across frames using opcode global_index.
+        // Without this, iterating the frame HashMap produces nondeterministic
+        // top-level ordering (e.g. starts from deep DELEGATECALL frames).
+        if hook_snapshots.is_empty() {
+            let mut ordered_opcodes: Vec<(ExecutionFrameId, OpcodeSnapshot<DB>)> = opcode_snapshots
+                .iter()
+                .flat_map(|(frame_id, snapshots)| {
+                    snapshots.iter().cloned().map(move |snapshot| (*frame_id, snapshot))
+                })
+                .collect();
+
+            ordered_opcodes.sort_by_key(|(_, snapshot)| snapshot.global_index);
+
+            for (frame_id, opcode_snapshot) in ordered_opcodes {
+                inner
+                    .push((frame_id, Snapshot::new_opcode(inner.len(), frame_id, opcode_snapshot)));
+            }
+
+            // Set linear next_id/prev_id so navigation RPCs do not fail.
+            let len = inner.len();
+            for idx in 0..len {
+                if let Some((_, snap)) = inner.get_mut(idx) {
+                    let next = if idx + 1 < len { idx + 1 } else { idx };
+                    snap.set_next_id(next);
+                    if idx > 0 {
+                        snap.set_prev_id(idx - 1);
+                    }
+                }
+            }
+
+            return Self { inner };
+        }
+
         // Process hook snapshots first (they take priority)
         for (frame_id, snapshot_opt) in hook_snapshots {
             match snapshot_opt {
@@ -353,14 +387,17 @@ where
             }
         }
 
-        // Include any remaining opcode snapshots for frames not covered by hooks
-        for (frame_id, opcode_frame_snapshots) in opcode_snapshots.iter() {
-            for opcode_snapshot in opcode_frame_snapshots {
-                inner.push((
-                    *frame_id,
-                    Snapshot::new_opcode(inner.len(), *frame_id, opcode_snapshot.clone()),
-                ));
-            }
+        // Include any remaining opcode snapshots for frames not covered by hooks,
+        // ordered by original capture sequence for deterministic behavior.
+        let mut remaining_opcodes: Vec<(ExecutionFrameId, OpcodeSnapshot<DB>)> = opcode_snapshots
+            .iter()
+            .flat_map(|(frame_id, snapshots)| {
+                snapshots.iter().cloned().map(move |snapshot| (*frame_id, snapshot))
+            })
+            .collect();
+        remaining_opcodes.sort_by_key(|(_, snapshot)| snapshot.global_index);
+        for (frame_id, opcode_snapshot) in remaining_opcodes {
+            inner.push((frame_id, Snapshot::new_opcode(inner.len(), frame_id, opcode_snapshot)));
         }
 
         // Set linear next_id/prev_id so navigation RPCs do not fail even when mixing hooks/opcodes.

@@ -1,16 +1,96 @@
 use alloy_primitives::Address;
+use alloy_transport_http::reqwest::Client;
 use eyre::{Context, Result};
 use foundry_block_explorers::contract::Metadata as EtherscanMetadata;
 use foundry_compilers::{
     artifacts::{output_selection::OutputSelection, CompilerOutput, SolcInput, Source, Sources},
     solc::SolcLanguage,
 };
-use alloy_transport_http::reqwest::Client;
 use semver::Version;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::{find_or_install_solc, Artifact};
+
+fn normalize_sourcify_settings_shape(settings: &mut Value, metadata_json: &Value) {
+    let Some(settings_obj) = settings.as_object_mut() else {
+        return;
+    };
+
+    let target_files: Vec<String> = settings_obj
+        .get("compilationTarget")
+        .and_then(Value::as_object)
+        .map(|targets| targets.keys().cloned().collect())
+        .filter(|targets: &Vec<String>| !targets.is_empty())
+        .or_else(|| {
+            metadata_json
+                .get("sources")
+                .and_then(Value::as_object)
+                .map(|sources| sources.keys().cloned().collect())
+                .filter(|sources: &Vec<String>| !sources.is_empty())
+        })
+        .unwrap_or_default();
+
+    let Some(libraries) = settings_obj.get_mut("libraries") else {
+        return;
+    };
+    let Some(libraries_obj) = libraries.as_object_mut() else {
+        return;
+    };
+
+    let has_nested_shape = libraries_obj.values().any(|value| value.is_object());
+    if has_nested_shape {
+        return;
+    }
+
+    let mut explicit_nested: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
+        std::collections::BTreeMap::new();
+    let mut flat_libraries = serde_json::Map::new();
+
+    for (name, value) in libraries_obj.iter() {
+        if value.is_string() {
+            if let Some((file, library_name)) = name.rsplit_once(':') {
+                explicit_nested
+                    .entry(file.to_string())
+                    .or_default()
+                    .insert(library_name.to_string(), value.clone());
+            } else {
+                flat_libraries.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    if explicit_nested.is_empty() && flat_libraries.is_empty() {
+        return;
+    }
+
+    let mut normalized = serde_json::Map::new();
+    for (file, libs) in explicit_nested {
+        normalized.insert(file, Value::Object(libs));
+    }
+
+    if !flat_libraries.is_empty() {
+        if target_files.is_empty() {
+            normalized
+                .entry("*".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        } else {
+            for file in target_files {
+                normalized.entry(file).or_insert_with(|| Value::Object(serde_json::Map::new()));
+            }
+        }
+
+        for libs_value in normalized.values_mut() {
+            let Some(libs_obj) = libs_value.as_object_mut() else {
+                continue;
+            };
+            for (library_name, address) in &flat_libraries {
+                libs_obj.entry(library_name.clone()).or_insert_with(|| address.clone());
+            }
+        }
+    }
+
+    *libraries = Value::Object(normalized);
+}
 
 /// Try to fetch an artifact from Sourcify (full_match then partial_match).
 ///
@@ -42,10 +122,11 @@ pub async fn fetch_artifact_from_sourcify(
             .and_then(Value::as_str)
             .ok_or_else(|| eyre::eyre!("sourcify metadata missing compiler.version"))?
             .to_string();
-        let settings_val = metadata_json
+        let mut settings_val = metadata_json
             .get("settings")
             .cloned()
             .ok_or_else(|| eyre::eyre!("sourcify metadata missing settings"))?;
+        normalize_sourcify_settings_shape(&mut settings_val, &metadata_json);
         let mut settings: foundry_compilers::artifacts::Settings =
             serde_json::from_value(settings_val).context("parse settings")?;
         settings.output_selection = OutputSelection::complete_output_selection();
@@ -68,11 +149,11 @@ pub async fn fetch_artifact_from_sourcify(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{base}sources/{path_str}"));
             // prefer repo source path over swarm/ipfs URLs
-            let source_url = if url.starts_with("bzzr://") 
-                || url.starts_with("bzz-raw://") 
+            let source_url = if url.starts_with("bzzr://")
+                || url.starts_with("bzz-raw://")
                 || url.starts_with("ipfs://")
                 || url.starts_with("dweb://")
-                || !url.starts_with("http") 
+                || !url.starts_with("http")
             {
                 format!("{base}sources/{path_str}")
             } else {
@@ -155,7 +236,8 @@ pub async fn fetch_artifact_from_sourcify(
             "Implementation": "",
             "SwarmSource": ""
         });
-        let metadata: EtherscanMetadata = serde_json::from_value(synth).context("synthesize metadata")?;
+        let metadata: EtherscanMetadata =
+            serde_json::from_value(synth).context("synthesize metadata")?;
 
         let artifact = Artifact { meta: metadata, input, output };
         return Ok(Some(artifact));
@@ -163,4 +245,3 @@ pub async fn fetch_artifact_from_sourcify(
 
     Ok(None)
 }
-
