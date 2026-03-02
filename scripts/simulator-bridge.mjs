@@ -106,9 +106,21 @@ function send503(res, err) {
 // HTTP Server
 // =============================================================================
 
+const EDB_API_KEY = process.env.EDB_API_KEY || "";
+
+// Comma-separated list of allowed origins, e.g. "https://example.com,https://app.example.com"
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean)
+);
+
 const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.size > 0 && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (ALLOWED_ORIGINS.size === 0) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.headers["access-control-request-private-network"] === "true") {
     res.setHeader("Access-Control-Allow-Private-Network", "true");
@@ -118,6 +130,18 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204);
     res.end();
     return;
+  }
+
+  // API key validation (check header or query param for SSE)
+  if (EDB_API_KEY) {
+    const headerKey = req.headers["x-api-key"];
+    const urlObj = new URL(req.url, `http://${req.headers.host}`);
+    const queryKey = urlObj.searchParams.get("apiKey");
+    if (headerKey !== EDB_API_KEY && queryKey !== EDB_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
   }
 
   const url = req.url?.split("?")[0];
@@ -170,7 +194,7 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Origin": ALLOWED_ORIGINS.size > 0 && ALLOWED_ORIGINS.has(origin) ? origin : ALLOWED_ORIGINS.size === 0 ? "*" : "",
       });
 
       if (job.status === "ready") {
