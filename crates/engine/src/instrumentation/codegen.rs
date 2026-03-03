@@ -25,23 +25,37 @@ use crate::{
 };
 
 pub fn generate_step_hook(version: &VersionRef, usid: USID) -> Option<String> {
+    let runtime_entropy = runtime_entropy_expr(version);
+
     // Solidity 0.4 does not support abi.encode, so we use a "0.4-compatible" way to encode the parameters.
     if **version < Version::parse("0.5.0").unwrap() {
         Some(format!(
-            // Include a runtime value (`gasleft()`) so optimizer cannot fold
+            // Include a runtime value so optimizer cannot fold
             // this hook into a compile-time constant and remove it.
-            "require(keccak256(uint256({}), uint256({}), uint256(gasleft())) != bytes32(uint256(0x2333)));",
+            "require(keccak256(uint256({}), uint256({}), uint256({})) != bytes32(uint256(0x2333)));",
             MAGIC_SNAPSHOT_NUMBER,
-            u64::from(usid)
+            u64::from(usid),
+            runtime_entropy
         ))
     } else {
         Some(format!(
-            // Include a runtime value (`gasleft()`) so optimizer cannot fold
+            // Include a runtime value so optimizer cannot fold
             // this hook into a compile-time constant and remove it.
-            "require(keccak256(abi.encode(uint256({}), uint256({}), uint256(gasleft()))) != bytes32(uint256(0x2333)));",
+            "require(keccak256(abi.encode(uint256({}), uint256({}), uint256({}))) != bytes32(uint256(0x2333)));",
             MAGIC_SNAPSHOT_NUMBER,
-            u64::from(usid)
+            u64::from(usid),
+            runtime_entropy
         ))
+    }
+}
+
+fn runtime_entropy_expr(version: &VersionRef) -> &'static str {
+    // `gasleft()` is unavailable in legacy 0.4.x contracts (e.g. 0.4.18 WETH9).
+    // Use `msg.gas` there and keep `gasleft()` for newer compilers.
+    if **version < Version::parse("0.4.21").unwrap() {
+        "msg.gas"
+    } else {
+        "gasleft()"
     }
 }
 
@@ -236,7 +250,10 @@ fn format_return_type(type_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::analysis;
+    use semver::Version;
 
     #[test]
     fn test_generate_view_method_primitive_types() {
@@ -452,5 +469,30 @@ mod tests {
                 _ => panic!("Unexpected variable name: {var_name}"),
             }
         }
+    }
+
+    #[test]
+    fn test_generate_step_hook_uses_msg_gas_for_legacy_solidity() {
+        let version = Arc::new(Version::parse("0.4.18").unwrap());
+        let usid = analysis::USID::next();
+        let hook = super::generate_step_hook(&version, usid).expect("hook should generate");
+        assert!(hook.contains("uint256(msg.gas)"));
+        assert!(!hook.contains("gasleft()"));
+    }
+
+    #[test]
+    fn test_generate_step_hook_uses_gasleft_for_supported_versions() {
+        let v_04_24 = Arc::new(Version::parse("0.4.24").unwrap());
+        let usid_legacy = analysis::USID::next();
+        let legacy_abi_hook =
+            super::generate_step_hook(&v_04_24, usid_legacy).expect("hook should generate");
+        assert!(legacy_abi_hook.contains("uint256(gasleft())"));
+
+        let v_08 = Arc::new(Version::parse("0.8.20").unwrap());
+        let usid_modern = analysis::USID::next();
+        let modern_hook =
+            super::generate_step_hook(&v_08, usid_modern).expect("hook should generate");
+        assert!(modern_hook.contains("abi.encode"));
+        assert!(modern_hook.contains("uint256(gasleft())"));
     }
 }
