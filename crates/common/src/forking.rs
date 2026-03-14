@@ -19,9 +19,10 @@
 //! This module provides ACTUAL REVM TRANSACTION EXECUTION with transact_commit()
 
 use crate::{get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id, EdbContext, EdbDB};
-use alloy_primitives::{address, Address, TxHash, TxKind, B256, U256};
+use alloy_network::{AnyNetwork, AnyRpcTransaction, TransactionResponse};
+use alloy_primitives::{address, Address, TxHash, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::{BlockNumberOrTag, Transaction, TransactionTrait};
+use alloy_rpc_types::{BlockNumberOrTag, TransactionTrait};
 use eyre::Result;
 use indicatif::ProgressBar;
 use revm::{
@@ -86,7 +87,7 @@ where
 
 /// Get chain id by querying RPC
 pub async fn get_chain_id(rpc_url: &str) -> Result<u64> {
-    let provider = ProviderBuilder::new().connect(rpc_url).await?;
+    let provider = ProviderBuilder::new_with_network::<AnyNetwork>().connect(rpc_url).await?;
     let chain_id = provider.get_chain_id().await?;
     Ok(chain_id)
 }
@@ -107,15 +108,12 @@ pub async fn fork_and_prepare(
 > {
     info!("forking chain and executing transactions with revm for {:?}", target_tx_hash);
 
-    let provider = ProviderBuilder::new().connect(rpc_url).await?;
+    let provider = ProviderBuilder::new_with_network::<AnyNetwork>().connect(rpc_url).await?;
 
     let chain_id = provider
         .get_chain_id()
         .await
         .map_err(|e| eyre::eyre!("Failed to get chain ID: {:?}", e))?;
-    if chain_id != 1 {
-        warn!("We currently only support mainnet (chain ID 1), got {chain_id}. Use it at your own risk.");
-    }
 
     // Get the target transaction to find which block it's in
     let target_tx = provider
@@ -124,10 +122,10 @@ pub async fn fork_and_prepare(
         .ok_or_else(|| eyre::eyre!("Target transaction not found: {:?}", target_tx_hash))?;
 
     // check if the tx is a system transaction
-    if is_known_system_sender(target_tx.inner.signer()) {
+    if is_known_system_sender(target_tx.from()) {
         return Err(eyre::eyre!(
             "{:?} is a system transaction.\nReplaying system transactions is currently not supported.",
-            target_tx.inner.tx_hash()
+            target_tx.tx_hash()
         ));
     }
 
@@ -189,10 +187,10 @@ pub async fn fork_and_prepare(
 
     // Find target transaction index and get preceding transactions
     // If full_tx_available is false, we skip this (no preceding txs to replay in quick mode)
-    let preceding_txs: Vec<&Transaction> = if full_tx_available {
+    let preceding_txs: Vec<&AnyRpcTransaction> = if full_tx_available {
         let target_index = transactions
             .iter()
-            .position(|tx| *tx.inner.hash() == target_tx_hash)
+            .position(|tx| tx.tx_hash() == target_tx_hash)
             .ok_or_else(|| eyre::eyre!("Target transaction not found in block"))?;
         transactions.iter().take(target_index).collect()
     } else {
@@ -241,7 +239,7 @@ pub async fn fork_and_prepare(
             b.basefee = block.header.base_fee_per_gas.unwrap_or_default();
             b.difficulty = block.header.difficulty;
             b.gas_limit = block.header.gas_limit;
-            b.prevrandao = Some(block.header.mix_hash);
+            b.prevrandao = block.header.mix_hash;
             // REVM requires blob_excess_gas_and_price for Cancun+ specs
             // Default to 0 if RPC doesn't return excess_blob_gas (some providers omit it)
             b.blob_excess_gas_and_price = if spec_id >= SpecId::CANCUN {
@@ -290,19 +288,20 @@ pub async fn fork_and_prepare(
             // System transactions such as on L2s don't contain any pricing info so
             // we skip them otherwise this would cause
             // reverts
-            if is_known_system_sender(tx.inner.signer()) {
+            if is_known_system_sender(tx.from()) {
                 console_bar.inc(1);
                 continue;
             }
 
-            let short_hash = &tx.inner.hash().to_string()[2..10]; // Skip 0x, take 8 chars
+            let tx_hash = tx.tx_hash();
+            let short_hash = &tx_hash.to_string()[2..10]; // Skip 0x, take 8 chars
             console_bar.set_message(format!("tx {}: 0x{}...", i + 1, short_hash));
 
             debug!(
                 "Executing transaction {}/{}: {:?}",
                 i + 1,
                 preceding_txs.len(),
-                tx.inner.hash()
+                tx_hash
             );
 
             let tx_env = get_tx_env_from_tx(tx, chain_id)?;
@@ -342,7 +341,7 @@ pub async fn fork_and_prepare(
                     return Err(eyre::eyre!(
                         "Transaction execution failed at index {} ({}): {:?}",
                         i,
-                        tx.inner.hash(),
+                        tx_hash,
                         e
                     ));
                 }
@@ -369,27 +368,28 @@ pub async fn fork_and_prepare(
 }
 
 /// Get the transaction environment from the transaction.
-pub fn get_tx_env_from_tx(tx: &Transaction, chain_id: u64) -> Result<TxEnv> {
+pub fn get_tx_env_from_tx(tx: &AnyRpcTransaction, chain_id: u64) -> Result<TxEnv> {
     let mut b = TxEnv::builder()
-        .caller(tx.inner.signer())
+        .caller(tx.from())
         .gas_limit(tx.gas_limit())
-        .gas_price(tx.gas_price().unwrap_or(tx.inner.max_fee_per_gas()))
+        .gas_price(
+            TransactionTrait::gas_price(tx).unwrap_or(TransactionTrait::max_fee_per_gas(tx)),
+        )
         .value(tx.value())
         .data(tx.input().to_owned())
         .gas_priority_fee(tx.max_priority_fee_per_gas())
         .chain_id(Some(chain_id))
         .nonce(tx.nonce())
         .access_list(tx.access_list().cloned().unwrap_or_default())
-        .kind(match tx.to() {
-            Some(to) => TxKind::Call(to),
-            None => TxKind::Create,
-        });
+        .kind(tx.kind());
 
     // Fees
-    if let Some(gp) = tx.gas_price() {
+    if let Some(gp) = TransactionTrait::gas_price(tx) {
         b = b.gas_price(gp);
     } else {
-        b = b.gas_price(tx.inner.max_fee_per_gas()).gas_priority_fee(tx.max_priority_fee_per_gas());
+        b = b
+            .gas_price(TransactionTrait::max_fee_per_gas(tx))
+            .gas_priority_fee(tx.max_priority_fee_per_gas());
     }
 
     // EIP-4844

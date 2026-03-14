@@ -2,6 +2,7 @@ use std::io::{self, Read};
 use std::str::FromStr;
 
 use alloy_eips::BlockNumberOrTag;
+use alloy_network::AnyNetwork;
 use alloy_primitives::{hex, keccak256, Address, Bytes, TxHash, TxKind, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use edb_common::{
@@ -1791,7 +1792,7 @@ async fn simulate_local_with_engine(
     let mut tx_env = build_tx_env(transaction, job.chain_id)?;
     let pseudo_tx_hash = compute_tx_hash_hint(transaction);
 
-    let provider = ProviderBuilder::new()
+    let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
         .connect(&job.rpc_url)
         .await
         .map_err(|error| SimulatorError::Rpc(format!("failed to connect to provider: {error}")))?;
@@ -1866,7 +1867,7 @@ async fn simulate_local_with_engine(
             block_env.basefee = block.header.base_fee_per_gas.unwrap_or_default();
             block_env.difficulty = block.header.difficulty;
             block_env.gas_limit = block.header.gas_limit;
-            block_env.prevrandao = Some(block.header.mix_hash);
+            block_env.prevrandao = block.header.mix_hash;
             // REVM requires blob_excess_gas_and_price for Cancun+ specs
             // Default to 0 if RPC doesn't return excess_blob_gas (some providers omit it)
             block_env.blob_excess_gas_and_price = if spec_id >= SpecId::CANCUN {
@@ -2194,7 +2195,7 @@ async fn simulate_local_lightweight(
 
     let mut tx_env = build_tx_env(transaction, job.chain_id)?;
 
-    let provider = ProviderBuilder::new()
+    let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
         .connect(&job.rpc_url)
         .await
         .map_err(|error| SimulatorError::Rpc(format!("failed to connect to provider: {error}")))?;
@@ -2254,7 +2255,7 @@ async fn simulate_local_lightweight(
             block_env.basefee = block.header.base_fee_per_gas.unwrap_or_default();
             block_env.difficulty = block.header.difficulty;
             block_env.gas_limit = block.header.gas_limit;
-            block_env.prevrandao = Some(block.header.mix_hash);
+            block_env.prevrandao = block.header.mix_hash;
             // REVM requires blob_excess_gas_and_price for Cancun+ specs
             // Default to 0 if RPC doesn't return excess_blob_gas (some providers omit it)
             block_env.blob_excess_gas_and_price = if spec_id >= SpecId::CANCUN {

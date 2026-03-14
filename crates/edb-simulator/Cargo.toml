@@ -19,6 +19,7 @@ edb-engine = { workspace = true }
 edb-common = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-provider = { workspace = true, features = ["reqwest"] }
+alloy-network = { workspace = true }
 alloy-rpc-types = { workspace = true, features = ["eth"] }
 alloy-eips = { workspace = true }
 # Required for FE artifact preloading
