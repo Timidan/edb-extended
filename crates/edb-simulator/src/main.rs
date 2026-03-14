@@ -1575,6 +1575,8 @@ async fn simulate_onchain(
 
     let gas_limit_suggested = Some(fork_result.target_tx_env.gas_limit.to_string());
 
+    let use_significant_opcode_snapshots = !keep_alive;
+
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(quick_mode)
         .with_precompute_state_variables(
@@ -1584,9 +1586,10 @@ async fn simulate_onchain(
                 && !job.analysis_options.quick_mode,
         )
         .with_collect_hook_snapshots(keep_alive && job.analysis_options.collect_snapshots)
-        // Trace parity mode: retain full opcode snapshots for rendered trace rows
-        // even in non-keep-alive simulations (reference-aligned gas/stack fidelity).
-        .with_significant_opcode_snapshots_only(false)
+        // Plain simulation results only render significant rows (entry frames,
+        // internal jumps, storage ops, logs, revert), so non-debug runs can
+        // capture only parity-critical opcode snapshots instead of every opcode.
+        .with_significant_opcode_snapshots_only(use_significant_opcode_snapshots)
         .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
@@ -1899,6 +1902,8 @@ async fn simulate_local_with_engine(
 
     let precompute_hook_states = env_flag("EDB_PRECOMPUTE_HOOK_STATES", false);
 
+    let use_significant_opcode_snapshots = !keep_alive;
+
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(job.analysis_options.quick_mode)
         .with_precompute_state_variables(
@@ -1908,9 +1913,10 @@ async fn simulate_local_with_engine(
                 && !job.analysis_options.quick_mode,
         )
         .with_collect_hook_snapshots(keep_alive && job.analysis_options.collect_snapshots)
-        // Trace parity mode: retain full opcode snapshots for rendered trace rows
-        // even in non-keep-alive simulations (reference-aligned gas/stack fidelity).
-        .with_significant_opcode_snapshots_only(false)
+        // Plain simulation results only render significant rows (entry frames,
+        // internal jumps, storage ops, logs, revert), so non-debug runs can
+        // capture only parity-critical opcode snapshots instead of every opcode.
+        .with_significant_opcode_snapshots_only(use_significant_opcode_snapshots)
         .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
