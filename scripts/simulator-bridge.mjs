@@ -68,6 +68,8 @@ import {
 
 import { handleChainControl } from "./chain-control.mjs";
 import { handleNodeManager } from "./node-manager.mjs";
+import { handleFileAccess } from "./file-access.mjs";
+import { handleCompilation } from "./compilation.mjs";
 
 // =============================================================================
 // Startup Validation
@@ -598,6 +600,16 @@ const server = http.createServer(async (req, res) => {
           const handled = await handleNodeManager(url, body, res);
           if (handled) break;
         }
+        // File access (workspace local dev)
+        if (url?.startsWith('/files/')) {
+          const handled = handleFileAccess(url, body, req, res);
+          if (handled) break;
+        }
+        // Compilation (workspace local dev)
+        if (url?.startsWith('/compile')) {
+          const handled = handleCompilation(url, body, res);
+          if (handled) break;
+        }
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "not_found" }));
         break;
@@ -642,6 +654,12 @@ server.listen(PORT, () => {
   console.log(`  POST /node/spawn       - Spawn local node process`);
   console.log(`  POST /node/kill        - Kill spawned node process`);
   console.log(`  GET  /node/status      - Get spawned node status`);
+  console.log(`  POST /files/open       - Open project directory`);
+  console.log(`  POST /files/read       - Read file contents`);
+  console.log(`  POST /files/write      - Write file contents`);
+  console.log(`  POST /files/close      - Close project`);
+  console.log(`  POST /compile/toolchain - Detect compilation toolchain`);
+  console.log(`  POST /compile          - Compile project`);
   console.log(`[simulator-bridge] concurrency: max=${MAX_CONCURRENT_SIMULATIONS} processes, queue=${SIMULATION_QUEUE_MAX}, queue_timeout=${SIMULATION_QUEUE_TIMEOUT_MS}ms`);
   console.log(`[simulator-bridge] memory-pressure: evict_threshold=${MEMORY_PRESSURE_THRESHOLD_MB}MB, hard_limit=${MEMORY_PRESSURE_HARD_LIMIT_MB}MB, system_total=${Math.round(totalmem() / (1024 * 1024))}MB`);
   console.log(`[simulator-bridge] keep-alive: max_sessions=${KEEP_ALIVE_MAX_SESSIONS}, idle_ttl=${KEEP_ALIVE_IDLE_TTL_MS / 1000}s, sweep_interval=${KEEP_ALIVE_SWEEP_INTERVAL_MS / 1000}s`);
