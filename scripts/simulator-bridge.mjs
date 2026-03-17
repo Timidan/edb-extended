@@ -66,6 +66,9 @@ import {
   runAsyncDebugPrep,
 } from "./debug-sessions.mjs";
 
+import { handleChainControl } from "./chain-control.mjs";
+import { handleNodeManager } from "./node-manager.mjs";
+
 // =============================================================================
 // Startup Validation
 // =============================================================================
@@ -248,6 +251,11 @@ const server = http.createServer(async (req, res) => {
         error: job.error,
       }));
       return;
+    }
+
+    if (url === '/node/status') {
+      const handled = await handleNodeManager(url, {}, res);
+      if (handled) return;
     }
 
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -579,9 +587,21 @@ const server = http.createServer(async (req, res) => {
         break;
       }
 
-      default:
+      default: {
+        // Chain control proxy (workspace local dev)
+        if (url?.startsWith('/chain/')) {
+          const handled = await handleChainControl(url, body, res);
+          if (handled) break;
+        }
+        // Node lifecycle management (workspace local dev)
+        if (url?.startsWith('/node/')) {
+          const handled = await handleNodeManager(url, body, res);
+          if (handled) break;
+        }
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "not_found" }));
+        break;
+      }
     }
   } catch (err) {
     if (err instanceof SimulationCapacityError) {
@@ -613,6 +633,15 @@ server.listen(PORT, () => {
   console.log(`  POST /debug/end    - End debug session`);
   console.log(`  POST /debug/sessions - List active sessions`);
   console.log(`  GET  /health       - Health check`);
+  console.log(`  POST /chain/connect    - Connect to local node`);
+  console.log(`  POST /chain/disconnect - Disconnect from local node`);
+  console.log(`  POST /chain/rpc       - Proxy RPC call to local node`);
+  console.log(`  POST /chain/snapshot   - Create EVM snapshot`);
+  console.log(`  POST /chain/revert     - Revert to EVM snapshot`);
+  console.log(`  POST /chain/mine       - Mine block(s)`);
+  console.log(`  POST /node/spawn       - Spawn local node process`);
+  console.log(`  POST /node/kill        - Kill spawned node process`);
+  console.log(`  GET  /node/status      - Get spawned node status`);
   console.log(`[simulator-bridge] concurrency: max=${MAX_CONCURRENT_SIMULATIONS} processes, queue=${SIMULATION_QUEUE_MAX}, queue_timeout=${SIMULATION_QUEUE_TIMEOUT_MS}ms`);
   console.log(`[simulator-bridge] memory-pressure: evict_threshold=${MEMORY_PRESSURE_THRESHOLD_MB}MB, hard_limit=${MEMORY_PRESSURE_HARD_LIMIT_MB}MB, system_total=${Math.round(totalmem() / (1024 * 1024))}MB`);
   console.log(`[simulator-bridge] keep-alive: max_sessions=${KEEP_ALIVE_MAX_SESSIONS}, idle_ttl=${KEEP_ALIVE_IDLE_TTL_MS / 1000}s, sweep_interval=${KEEP_ALIVE_SWEEP_INTERVAL_MS / 1000}s`);
