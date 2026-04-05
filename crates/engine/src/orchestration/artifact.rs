@@ -41,21 +41,15 @@ use crate::{
 ///
 /// Many chains (Base, Fraxtal, Mode, etc.) have deprecated their chain-native V1 APIs
 /// and now require using the Etherscan V2 unified API (api.etherscan.io/v2/api).
-/// The V2 API requires a Pro-tier API key for non-mainnet chains.
 ///
-/// This function returns the correct V2 unified API URL for chains that have migrated,
-/// or None to use the default chain mapping for chains that still support V1.
+/// Etherscan has fully deprecated all V1 endpoints (mainnet + testnets).
+/// Use the V2 unified API for all chains. The V2 endpoint returns errors
+/// for unsupported chains, which we handle by falling back to Sourcify.
 fn get_etherscan_v2_api_url(chain_id: u64) -> Option<String> {
-    match chain_id {
-        // Base chains - migrated to Etherscan V2 unified API (chain-native API deprecated)
-        8453 | 84532 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
-        // Fraxtal chains - migrated to Etherscan V2 unified API
-        252 | 2522 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
-        // Mode chains - migrated to Etherscan V2 unified API
-        34443 | 919 => Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id)),
-        // Other chains - use default mapping (chain-native APIs still work)
-        _ => None,
-    }
+    // Etherscan has fully deprecated all V1 endpoints (mainnet + testnets).
+    // Use the V2 unified API for all chains. The V2 endpoint returns errors
+    // for unsupported chains, which we handle by falling back to Sourcify.
+    Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id))
 }
 
 /// Download and compile verified source code for each contract.

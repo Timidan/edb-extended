@@ -100,6 +100,42 @@ pub fn get_blob_base_fee_update_fraction_by_spec_id(spec: SpecId) -> u64 {
     }
 }
 
+/// Infer the SpecId from block header features for non-mainnet chains.
+/// Uses the presence of EIP-specific fields to determine the hardfork level.
+///
+/// Detection heuristic (ordered from newest to oldest):
+/// - `requests_hash` present       → PRAGUE (EIP-7685)
+/// - `excess_blob_gas` present     → CANCUN (EIP-4844)
+/// - `withdrawals_root` present    → SHANGHAI (EIP-4895)
+/// - difficulty == 0 (PoS)         → MERGE
+/// - `base_fee_per_gas` present    → LONDON (EIP-1559)
+/// - Otherwise                     → BERLIN (safe default for modern testnets)
+pub fn infer_spec_from_block_header(
+    base_fee_per_gas: Option<u64>,
+    excess_blob_gas: Option<u64>,
+    difficulty: alloy_primitives::U256,
+    withdrawals_root: Option<alloy_primitives::B256>,
+    requests_hash: Option<alloy_primitives::B256>,
+) -> SpecId {
+    if requests_hash.is_some() {
+        return SpecId::PRAGUE;
+    }
+    if excess_blob_gas.is_some() {
+        return SpecId::CANCUN;
+    }
+    if withdrawals_root.is_some() {
+        return SpecId::SHANGHAI;
+    }
+    if difficulty.is_zero() {
+        return SpecId::MERGE;
+    }
+    if base_fee_per_gas.is_some() {
+        return SpecId::LONDON;
+    }
+    // Safe default for any modern chain
+    SpecId::BERLIN
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

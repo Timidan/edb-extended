@@ -18,7 +18,7 @@
 //!
 //! This module provides ACTUAL REVM TRANSACTION EXECUTION with transact_commit()
 
-use crate::{get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id, EdbContext, EdbDB};
+use crate::{get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id, infer_spec_from_block_header, EdbContext, EdbDB};
 use alloy_network::{AnyNetwork, AnyRpcTransaction, TransactionResponse};
 use alloy_primitives::{address, Address, TxHash, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -198,9 +198,22 @@ pub async fn fork_and_prepare(
         Vec::new()
     };
 
-    // Get the spec ID for the block using our mainnet mapping
-    let spec_id = get_mainnet_spec_id(target_block_number);
+    // Get the spec ID — use mainnet block-number mapping for chain 1,
+    // infer from block header features for all other chains (testnets, L2s, etc.)
+    let spec_id = if chain_id == 1 {
+        get_mainnet_spec_id(target_block_number)
+    } else {
+        infer_spec_from_block_header(
+            block.header.base_fee_per_gas,
+            block.header.excess_blob_gas,
+            block.header.difficulty,
+            block.header.withdrawals_root,
+            block.header.requests_hash,
+        )
+    };
     info!("Block {} is under {:?} hardfork", target_block_number, spec_id);
+    let evm_version_label = if chain_id == 1 { "mainnet block-number mapping" } else { "block header inference" };
+    info!("The evm verision is {:?} (detected via {})", spec_id, evm_version_label);
 
     // Create fork info
     let fork_info = ForkInfo {
