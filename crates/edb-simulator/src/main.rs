@@ -83,6 +83,12 @@ struct SimulationJob {
     artifact_path: Option<String>,
     #[serde(default, alias = "artifacts_inline")]
     artifacts_inline: Option<Value>,
+    /// Events-only fast path. Tells the engine to skip source download and
+    /// analysis (Steps 2/3) entirely. The raw trace still carries event logs,
+    /// which is all that asset-movement / Transfer-extraction consumers read.
+    /// Matches the FE hint `liteEventsOnly` on the payload.
+    #[serde(default, alias = "liteEventsOnly")]
+    lite_events_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1578,6 +1584,13 @@ async fn simulate_onchain(
 
     let use_significant_opcode_snapshots = !keep_alive;
 
+    // Events-only mode is incompatible with keep-alive debug sessions (those
+    // need source-level snapshots), so it's silently forced off in that case.
+    let events_only = job.lite_events_only && !keep_alive;
+    if events_only {
+        info!("[PERF] events-only mode enabled (onchain): skipping Step 2/3 in engine");
+    }
+
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(quick_mode)
         .with_precompute_state_variables(
@@ -1591,6 +1604,7 @@ async fn simulate_onchain(
         // internal jumps, storage ops, logs, revert), so non-debug runs can
         // capture only parity-critical opcode snapshots instead of every opcode.
         .with_significant_opcode_snapshots_only(use_significant_opcode_snapshots)
+        .with_events_only(events_only)
         .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
@@ -1600,12 +1614,13 @@ async fn simulate_onchain(
     let engine = Engine::new(engine_config);
     let target_tx_hash = fork_result.target_tx_hash;
 
-    // Load user-provided artifacts before engine preparation
-    let provided_artifacts = load_user_artifacts(job)?;
+    // Load user-provided artifacts before engine preparation.
+    // Skipped in events-only mode — the engine won't consult them anyway.
+    let provided_artifacts = if events_only { None } else { load_user_artifacts(job)? };
 
     // Convert FE-provided JSON artifacts to engine Artifact format for preloading
     // This allows the engine to skip downloading from Sourcify/Etherscan for these addresses
-    let preloaded_artifacts = preload_artifacts_from_job(job)?;
+    let preloaded_artifacts = if events_only { None } else { preload_artifacts_from_job(job)? };
     if let Some(ref preloaded) = preloaded_artifacts {
         info!("Preloading {} FE-compiled artifacts into engine", preloaded.len());
     }
@@ -1905,6 +1920,13 @@ async fn simulate_local_with_engine(
 
     let use_significant_opcode_snapshots = !keep_alive;
 
+    // Events-only mode is incompatible with keep-alive debug sessions (those
+    // need source-level snapshots), so it's silently forced off in that case.
+    let events_only = job.lite_events_only && !keep_alive;
+    if events_only {
+        info!("[PERF] events-only mode enabled (local): skipping Step 2/3 in engine");
+    }
+
     let mut engine_config = EngineConfig::default()
         .with_quick_mode(job.analysis_options.quick_mode)
         .with_precompute_state_variables(
@@ -1918,6 +1940,7 @@ async fn simulate_local_with_engine(
         // internal jumps, storage ops, logs, revert), so non-debug runs can
         // capture only parity-critical opcode snapshots instead of every opcode.
         .with_significant_opcode_snapshots_only(use_significant_opcode_snapshots)
+        .with_events_only(events_only)
         .with_artifact_source_priority(job.analysis_options.artifact_source_priority.clone())
         .with_rpc_proxy_url(job.rpc_url.clone());
     if let Some(ref key) = job.analysis_options.etherscan_api_key {
@@ -1927,11 +1950,12 @@ async fn simulate_local_with_engine(
     let engine = Engine::new(engine_config);
     let target_tx_hash = fork_result.target_tx_hash;
 
-    // Load user-provided artifacts before engine preparation
-    let provided_artifacts = load_user_artifacts(job)?;
+    // Load user-provided artifacts before engine preparation.
+    // Skipped in events-only mode — the engine won't consult them anyway.
+    let provided_artifacts = if events_only { None } else { load_user_artifacts(job)? };
 
     // Convert FE-provided JSON artifacts to engine Artifact format for preloading (local mode)
-    let preloaded_artifacts = preload_artifacts_from_job(job)?;
+    let preloaded_artifacts = if events_only { None } else { preload_artifacts_from_job(job)? };
     if let Some(ref preloaded) = preloaded_artifacts {
         info!("Preloading {} FE-compiled artifacts into engine (local mode)", preloaded.len());
     }

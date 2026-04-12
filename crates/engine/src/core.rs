@@ -85,6 +85,14 @@ pub struct EngineConfig {
     /// Capture only significant opcodes during opcode snapshot pass.
     /// This keeps V3 render parity-critical opcodes while cutting non-debug replay cost.
     pub significant_opcode_snapshots_only: bool,
+    /// Events-only mode: short-circuit after Step 1 (replay). When enabled, the
+    /// engine skips Step 2 (source download from Etherscan/Sourcify) and Step 3
+    /// (source analysis) entirely and builds an `EngineContext` with empty
+    /// artifacts. The raw execution trace still carries event logs, which is
+    /// all that asset-movement / Transfer-extraction consumers read. Drops
+    /// engine.prepare() from ~19s to ~2.5s on DepositFlow-style transactions
+    /// where the source download dominates.
+    pub events_only: bool,
 }
 
 impl Default for EngineConfig {
@@ -97,6 +105,7 @@ impl Default for EngineConfig {
             collect_hook_snapshots: true,
             artifact_source_priority: Vec::new(),
             significant_opcode_snapshots_only: false,
+            events_only: false,
         }
     }
 }
@@ -138,6 +147,13 @@ impl EngineConfig {
         significant_opcode_snapshots_only: bool,
     ) -> Self {
         self.significant_opcode_snapshots_only = significant_opcode_snapshots_only;
+        self
+    }
+
+    /// Enable events-only mode: skips source download and analysis, returns
+    /// a minimal context that still carries the raw trace (and its event logs).
+    pub fn with_events_only(mut self, events_only: bool) -> Self {
+        self.events_only = events_only;
         self
     }
 
@@ -310,44 +326,67 @@ impl Engine {
         );
 
         // Step 2: Download verified source code for each contract
-        // (skipping addresses that have pre-loaded artifacts from frontend)
-        send_progress!(2, 8, "Downloading verified source code for each contract...");
-        let step_start = Instant::now();
-        let artifacts = orchestration::download_verified_source_code(
-            &self.config,
-            &replay_result,
-            ctx.chain_id().to::<u64>(),
-            preloaded_artifacts,
-        )
-        .await?;
-        info!(
-            "[TIMING] Step 2 - download_verified_source_code: {:.2}s ({} contracts)",
-            step_start.elapsed().as_secs_f64(),
-            artifacts.len()
-        );
-
-        // Log degradation warning if no artifacts found - we'll still get opcode-level traces
-        let touched_contracts = replay_result.visited_addresses.len();
-        if artifacts.is_empty() && touched_contracts > 0 {
-            warn!(
-                "No verified source code found for any of the {} touched contracts. \
-                 Debugging will use opcode-level traces only (no source-level debugging available).",
-                touched_contracts
-            );
-        } else if !artifacts.is_empty() && artifacts.len() < touched_contracts {
+        // (skipping addresses that have pre-loaded artifacts from frontend).
+        // Events-only callers (e.g. asset-movement extraction) only consume
+        // the raw trace's event logs and don't need artifacts at all, so we
+        // short-circuit the whole source-fetch pipeline here — this is the
+        // dominant cost on DepositFlow-style calls (~16s).
+        let artifacts = if self.config.events_only {
+            send_progress!(2, 8, "Skipping source download (events-only mode)...");
+            info!("[PERF] Skipping Step 2 - download_verified_source_code (events_only)");
+            std::collections::HashMap::new()
+        } else {
+            send_progress!(2, 8, "Downloading verified source code for each contract...");
+            let step_start = Instant::now();
+            let artifacts = orchestration::download_verified_source_code(
+                &self.config,
+                &replay_result,
+                ctx.chain_id().to::<u64>(),
+                preloaded_artifacts,
+            )
+            .await?;
             info!(
-                "Source code found for {}/{} touched contracts. \
-                 Contracts without source will use opcode-level traces.",
-                artifacts.len(),
-                touched_contracts
+                "[TIMING] Step 2 - download_verified_source_code: {:.2}s ({} contracts)",
+                step_start.elapsed().as_secs_f64(),
+                artifacts.len()
             );
-        }
 
-        // Step 3: Analyze source code to identify instrumentation points
-        send_progress!(3, 8, "Analyzing source code to identify instrumentation points...");
-        let step_start = Instant::now();
-        let analysis_results = orchestration::analyze_source_code(&artifacts)?;
-        info!("[TIMING] Step 3 - analyze_source_code: {:.2}s", step_start.elapsed().as_secs_f64());
+            // Log degradation warning if no artifacts found - we'll still get opcode-level traces
+            let touched_contracts = replay_result.visited_addresses.len();
+            if artifacts.is_empty() && touched_contracts > 0 {
+                warn!(
+                    "No verified source code found for any of the {} touched contracts. \
+                     Debugging will use opcode-level traces only (no source-level debugging available).",
+                    touched_contracts
+                );
+            } else if !artifacts.is_empty() && artifacts.len() < touched_contracts {
+                info!(
+                    "Source code found for {}/{} touched contracts. \
+                     Contracts without source will use opcode-level traces.",
+                    artifacts.len(),
+                    touched_contracts
+                );
+            }
+            artifacts
+        };
+
+        // Step 3: Analyze source code to identify instrumentation points.
+        // With no artifacts in events-only mode this is a no-op, but we still
+        // skip the function call so it doesn't even touch the HashMap iterator.
+        let analysis_results = if self.config.events_only {
+            send_progress!(3, 8, "Skipping source analysis (events-only mode)...");
+            info!("[PERF] Skipping Step 3 - analyze_source_code (events_only)");
+            std::collections::HashMap::new()
+        } else {
+            send_progress!(3, 8, "Analyzing source code to identify instrumentation points...");
+            let step_start = Instant::now();
+            let analysis_results = orchestration::analyze_source_code(&artifacts)?;
+            info!(
+                "[TIMING] Step 3 - analyze_source_code: {:.2}s",
+                step_start.elapsed().as_secs_f64()
+            );
+            analysis_results
+        };
 
         // Step 4: Instrument source code (debug/hook pipeline only).
         // Non-debug simulations can render V3 traces from canonical artifacts + opcode snapshots.
