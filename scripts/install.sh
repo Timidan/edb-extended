@@ -488,6 +488,29 @@ main() {
     # Ensure PATH includes cargo bin
     ensure_cargo_path
 
+    # -----------------------------------------------------------------------------
+    # Optional: install Heimdall for Transaction Analysis Deep Dive + unverified
+    # Storage Inspector. Controlled by INSTALL_HEIMDALL=1 (default) or =0 to skip.
+    # -----------------------------------------------------------------------------
+    if [[ "${INSTALL_HEIMDALL:-1}" == "1" ]]; then
+        if command -v heimdall >/dev/null 2>&1; then
+            print_success "Heimdall already installed: $(heimdall --version)"
+        else
+            print_info "Installing Heimdall via bifrost..."
+            if curl -fsSL https://raw.githubusercontent.com/Jon-Becker/heimdall-rs/main/bifrost/install | bash; then
+                if command -v bifrost >/dev/null 2>&1; then
+                    bifrost -v latest || print_info "bifrost install failed — install heimdall manually if needed"
+                else
+                    print_info "bifrost installed to ~/.bifrost/bin; add to PATH and re-run to install heimdall"
+                fi
+            else
+                print_info "Heimdall install skipped — network error. Set INSTALL_HEIMDALL=0 to suppress this."
+            fi
+        fi
+    else
+        print_info "Skipping Heimdall install (INSTALL_HEIMDALL=0)"
+    fi
+
     # Success message
     echo ""
     print_success "=========================================="
