@@ -224,3 +224,92 @@ export class SimulationSemaphore {
     }
   }
 }
+
+// =============================================================================
+// Heimdall CLI configuration
+// =============================================================================
+
+export const HEIMDALL_BIN_PATH = process.env.HEIMDALL_BIN_PATH || "heimdall";
+export const HEIMDALL_DECOMPILE_TIMEOUT_MS = Number.parseInt(
+  process.env.HEIMDALL_DECOMPILE_TIMEOUT_MS || "60000",
+  10,
+);
+export const HEIMDALL_DUMP_TIMEOUT_MS = Number.parseInt(
+  process.env.HEIMDALL_DUMP_TIMEOUT_MS || "180000",
+  10,
+);
+export const HEIMDALL_CACHE_MAX_ENTRIES = Number.parseInt(
+  process.env.HEIMDALL_CACHE_MAX_ENTRIES || "256",
+  10,
+);
+export const HEIMDALL_CACHE_TTL_MS = Number.parseInt(
+  process.env.HEIMDALL_CACHE_TTL_MS || String(60 * 60 * 1000),
+  10,
+);
+export const HEIMDALL_CONCURRENCY = Number.parseInt(
+  process.env.HEIMDALL_CONCURRENCY || "2",
+  10,
+);
+
+// Server-side RPC allowlist, keyed by chainId. The bridge NEVER accepts a raw
+// rpcUrl from the client (SSRF risk: internal hosts, cloud metadata endpoints,
+// private RFC-1918 nets). Clients pass chainId; server resolves here.
+// Override per-deployment with HEIMDALL_RPC_BY_CHAIN (JSON).
+const DEFAULT_RPC_BY_CHAIN = {
+  1: "https://cloudflare-eth.com",
+  10: "https://mainnet.optimism.io",
+  8453: "https://mainnet.base.org",
+  42161: "https://arb1.arbitrum.io/rpc",
+};
+function parseRpcByChain() {
+  const raw = process.env.HEIMDALL_RPC_BY_CHAIN;
+  if (!raw) return { ...DEFAULT_RPC_BY_CHAIN };
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return { ...DEFAULT_RPC_BY_CHAIN };
+    const out = { ...DEFAULT_RPC_BY_CHAIN };
+    for (const [k, v] of Object.entries(parsed)) {
+      const chain = Number.parseInt(k, 10);
+      if (!Number.isInteger(chain) || chain <= 0) continue;
+      if (typeof v !== "string") continue;
+      out[chain] = v;
+    }
+    return out;
+  } catch {
+    return { ...DEFAULT_RPC_BY_CHAIN };
+  }
+}
+export const HEIMDALL_RPC_BY_CHAIN = parseRpcByChain();
+
+// Defense in depth on top of the chain-id allowlist — reject URLs that point
+// at loopback, link-local, RFC-1918 private nets, or cloud metadata endpoints.
+function isPrivateOrInternalHost(hostname) {
+  const h = hostname.toLowerCase();
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h === "0.0.0.0" || h === "::" || h === "::1") return true;
+  if (h === "169.254.169.254") return true;
+  if (h === "metadata.google.internal") return true;
+  if (/^127\./.test(h)) return true;
+  if (/^10\./.test(h)) return true;
+  if (/^192\.168\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
+  if (/^fe80:/i.test(h)) return true;
+  return false;
+}
+
+export function resolveHeimdallRpcUrl(chainId) {
+  const url = HEIMDALL_RPC_BY_CHAIN[chainId];
+  if (!url) return { ok: false, reason: "chain_not_allowlisted" };
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      return { ok: false, reason: "bad_rpc_scheme" };
+    }
+    if (isPrivateOrInternalHost(u.hostname)) {
+      return { ok: false, reason: "rpc_host_blocked" };
+    }
+    return { ok: true, url };
+  } catch {
+    return { ok: false, reason: "bad_rpc_url" };
+  }
+}

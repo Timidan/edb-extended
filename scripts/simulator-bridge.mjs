@@ -70,6 +70,7 @@ import { handleChainControl } from "./chain-control.mjs";
 import { handleNodeManager } from "./node-manager.mjs";
 import { handleFileAccess } from "./file-access.mjs";
 import { handleCompilation } from "./compilation.mjs";
+import { handleHeimdall } from "./heimdall-manager.mjs";
 
 // =============================================================================
 // Startup Validation
@@ -610,6 +611,11 @@ const server = http.createServer(async (req, res) => {
           const handled = handleCompilation(url, body, res);
           if (handled) break;
         }
+        // Heimdall decompilation / storage dump (droplet + workspace)
+        if (url?.startsWith('/heimdall/')) {
+          const handled = await handleHeimdall(url, body, res);
+          if (handled) break;
+        }
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "not_found" }));
         break;
@@ -660,6 +666,9 @@ server.listen(PORT, () => {
   console.log(`  POST /files/close      - Close project`);
   console.log(`  POST /compile/toolchain - Detect compilation toolchain`);
   console.log(`  POST /compile          - Compile project`);
+  console.log(`  POST /heimdall/version   - Check Heimdall availability`);
+  console.log(`  POST /heimdall/decompile - Decompile bytecode / address via Heimdall`);
+  console.log(`  POST /heimdall/dump      - Storage dump via Heimdall`);
   console.log(`[simulator-bridge] concurrency: max=${MAX_CONCURRENT_SIMULATIONS} processes, queue=${SIMULATION_QUEUE_MAX}, queue_timeout=${SIMULATION_QUEUE_TIMEOUT_MS}ms`);
   console.log(`[simulator-bridge] memory-pressure: evict_threshold=${MEMORY_PRESSURE_THRESHOLD_MB}MB, hard_limit=${MEMORY_PRESSURE_HARD_LIMIT_MB}MB, system_total=${Math.round(totalmem() / (1024 * 1024))}MB`);
   console.log(`[simulator-bridge] keep-alive: max_sessions=${KEEP_ALIVE_MAX_SESSIONS}, idle_ttl=${KEEP_ALIVE_IDLE_TTL_MS / 1000}s, sweep_interval=${KEEP_ALIVE_SWEEP_INTERVAL_MS / 1000}s`);
