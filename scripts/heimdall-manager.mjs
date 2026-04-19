@@ -4,6 +4,9 @@
 // Dispatches POST /heimdall/{version,decompile,dump}.
 
 import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as pathJoin } from "node:path";
 import {
   HEIMDALL_BIN_PATH,
   HEIMDALL_DECOMPILE_TIMEOUT_MS,
@@ -15,6 +18,16 @@ import {
 } from "./bridge-config.mjs";
 import { runHeimdallSubprocess, HeimdallRunError } from "./heimdall-runner.mjs";
 import { createLruCache } from "./heimdall-cache.mjs";
+
+function makeHeimdallWorkdir(prefix) {
+  return mkdtempSync(pathJoin(tmpdir(), `${prefix}-`));
+}
+function safeRmDir(dir) {
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+}
+function readIfExists(path) {
+  try { return readFileSync(path, "utf8"); } catch { return null; }
+}
 
 const resultCache = createLruCache({
   maxEntries: HEIMDALL_CACHE_MAX_ENTRIES,
@@ -149,7 +162,8 @@ async function handleDecompile(body, res) {
   }
 
   let cacheKey;
-  let args;
+  let target;
+  let extraArgs = [];
   let resolvedHash;
 
   if (bytecode !== undefined) {
@@ -158,7 +172,7 @@ async function handleDecompile(body, res) {
     }
     resolvedHash = sha256Hex(Buffer.from(bytecode.slice(2), "hex"));
     cacheKey = `decompile:${resolvedHash}`;
-    args = ["decompile", bytecode, "--output", "json", "--skip-resolving", "--no-tui"];
+    target = bytecode;
   } else if (address !== undefined) {
     if (!isAddress(address)) {
       return sendError(res, 400, "bad_request", "address must be 0x-prefixed 20-byte hex");
@@ -176,7 +190,8 @@ async function handleDecompile(body, res) {
     }
     resolvedHash = fetched.hash;
     cacheKey = `decompile:${chainId}:${address.toLowerCase()}:${resolvedHash}`;
-    args = ["decompile", address, "--rpc-url", resolved.url, "--output", "json", "--skip-resolving", "--no-tui"];
+    target = address;
+    extraArgs = ["-r", resolved.url];
   } else {
     return sendError(res, 400, "bad_request", "Provide either bytecode or (address + chainId)");
   }
@@ -187,6 +202,16 @@ async function handleDecompile(body, res) {
   }
 
   const heimdallVersion = await resolveHeimdallVersion();
+  const workdir = makeHeimdallWorkdir("edb-heimdall-decompile");
+  const args = [
+    "decompile",
+    target,
+    "-o", workdir,
+    "-n", "out",
+    "--skip-resolving",
+    "--include-sol",
+    ...extraArgs,
+  ];
 
   let result;
   try {
@@ -196,28 +221,36 @@ async function handleDecompile(body, res) {
       timeoutMs: HEIMDALL_DECOMPILE_TIMEOUT_MS,
     }));
   } catch (err) {
+    safeRmDir(workdir);
     const { status, code } = classifyRunError(err);
     return sendError(res, status, code, err?.message, err?.stderr);
   }
 
   if (result.exitCode !== 0) {
+    safeRmDir(workdir);
     return sendError(res, 502, "heimdall_upstream_error", `heimdall exit ${result.exitCode}`, result.stderr);
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(result.stdout);
-  } catch {
-    return sendError(res, 502, "heimdall_invalid_output", "heimdall did not return JSON", result.stdout.slice(0, 500));
-  }
+  const source = readIfExists(pathJoin(workdir, "out-decompiled.sol"));
+  const abiRaw = readIfExists(pathJoin(workdir, "out-abi.json"));
+  safeRmDir(workdir);
 
-  if (typeof parsed.source !== "string" || !Array.isArray(parsed.abi)) {
-    return sendError(res, 502, "heimdall_invalid_output", "heimdall JSON missing source/abi", JSON.stringify(parsed).slice(0, 500));
+  if (source === null || abiRaw === null) {
+    return sendError(res, 502, "heimdall_invalid_output", "heimdall output files missing");
+  }
+  let abi;
+  try {
+    abi = JSON.parse(abiRaw);
+  } catch {
+    return sendError(res, 502, "heimdall_invalid_output", "heimdall abi.json not valid JSON", abiRaw.slice(0, 500));
+  }
+  if (!Array.isArray(abi)) {
+    return sendError(res, 502, "heimdall_invalid_output", "heimdall abi.json is not an array");
   }
 
   const response = {
-    source: parsed.source,
-    abi: parsed.abi,
+    source,
+    abi,
     bytecodeHash: resolvedHash,
     heimdallVersion,
     cacheHit: false,
@@ -304,28 +337,51 @@ async function handleDump(body, res) {
   }
 
   const heimdallVersion = await resolveHeimdallVersion();
+  const workdir = makeHeimdallWorkdir("edb-heimdall-dump");
+  const args = ["dump", address, "-r", resolved.url, "-o", workdir, "-n", "out"];
+  if (block.cacheable && block.tag !== "earliest") {
+    args.push("-f", block.tag, "-t", block.tag);
+  }
 
   let result;
   try {
     result = await withHeimdallSlot(() => runHeimdallSubprocess({
       bin: HEIMDALL_BIN_PATH,
-      args: ["dump", address, "--rpc-url", resolved.url, "--block", block.tag, "--output", "json"],
+      args,
       timeoutMs: HEIMDALL_DUMP_TIMEOUT_MS,
     }));
   } catch (err) {
+    safeRmDir(workdir);
     const { status, code } = classifyRunError(err);
     return sendError(res, status, code, err?.message, err?.stderr);
   }
 
   if (result.exitCode !== 0) {
+    safeRmDir(workdir);
     return sendError(res, 502, "heimdall_upstream_error", `heimdall exit ${result.exitCode}`, result.stderr);
+  }
+
+  let outputFile = null;
+  try {
+    for (const entry of readdirSync(workdir)) {
+      if (entry.endsWith(".json") || entry.endsWith(".csv")) {
+        outputFile = pathJoin(workdir, entry);
+        break;
+      }
+    }
+  } catch { /* dir missing */ }
+  const rawContent = outputFile ? readIfExists(outputFile) : null;
+  safeRmDir(workdir);
+
+  if (rawContent === null) {
+    return sendError(res, 502, "heimdall_invalid_output", "heimdall dump produced no output file");
   }
 
   let raw;
   try {
-    raw = JSON.parse(result.stdout);
+    raw = JSON.parse(rawContent);
   } catch {
-    return sendError(res, 502, "heimdall_invalid_output", "heimdall did not return JSON", result.stdout.slice(0, 500));
+    return sendError(res, 502, "heimdall_invalid_output", "heimdall dump output not JSON", rawContent.slice(0, 500));
   }
 
   const slots = normalizeDumpSlots(raw);
