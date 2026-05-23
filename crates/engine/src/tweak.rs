@@ -165,9 +165,34 @@ where
             tweak_start.elapsed().as_secs_f64()
         );
 
+        self.replace_deployed_code(addr, tweaked_code, "creation replay")
+    }
+
+    /// Replaces deployed contract bytecode with the recompiled deployed runtime directly.
+    ///
+    /// This is a fallback for chains where no Etherscan-style creation transaction API exists.
+    /// It skips constructor replay, so contracts with constructor-populated immutable references
+    /// may still need the creation-transaction path.
+    pub fn tweak_deployed_runtime(
+        &mut self,
+        addr: &Address,
+        artifact: &Artifact,
+        recompiled_artifact: &Artifact,
+    ) -> Result<()> {
+        let tweaked_code =
+            self.get_recompiled_deployed_runtime(addr, artifact, recompiled_artifact)?;
+        self.replace_deployed_code(addr, tweaked_code, "direct runtime")
+    }
+
+    fn replace_deployed_code(
+        &mut self,
+        addr: &Address,
+        tweaked_code: Bytes,
+        mode: &str,
+    ) -> Result<()> {
         if tweaked_code.is_empty() {
-            error!(addr=?addr, quick=?quick, "Tweaked code is empty");
-            return Err(eyre!("tweaked bytecode is empty (addr={}, quick={})", addr, quick));
+            error!(addr=?addr, mode=%mode, "Tweaked code is empty");
+            return Err(eyre!("tweaked bytecode is empty (addr={}, mode={})", addr, mode));
         }
 
         let db = self.ctx.db_mut();
@@ -182,6 +207,72 @@ where
         db.insert_account_info(*addr, info);
 
         Ok(())
+    }
+
+    fn get_recompiled_deployed_runtime(
+        &mut self,
+        addr: &Address,
+        artifact: &Artifact,
+        recompiled_artifact: &Artifact,
+    ) -> Result<Bytes> {
+        let preferred_name = artifact.contract_name();
+        let mut candidates = Vec::new();
+
+        for (path, contracts) in &recompiled_artifact.output.contracts {
+            for (name, contract) in contracts {
+                let Some(runtime) = contract
+                    .evm
+                    .as_ref()
+                    .and_then(|evm| evm.deployed_bytecode.as_ref())
+                    .and_then(|deployed| deployed.bytes())
+                    .cloned()
+                else {
+                    continue;
+                };
+                candidates.push((
+                    name == preferred_name,
+                    runtime.len(),
+                    path.display().to_string(),
+                    name.clone(),
+                    runtime,
+                ));
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+
+        let Some((preferred, runtime_len, file_path, contract_name, runtime)) =
+            candidates.into_iter().next()
+        else {
+            return Err(eyre!(
+                "no recompiled deployed runtime found for {} (preferred='{}')",
+                addr,
+                preferred_name
+            ));
+        };
+
+        if !preferred && !preferred_name.is_empty() {
+            debug!(
+                "Direct runtime fallback for {} selected {}:{} instead of preferred '{}'",
+                addr, file_path, contract_name, preferred_name
+            );
+        }
+        info!(
+            target_address = %addr,
+            selected_contract = %contract_name,
+            selected_file = %file_path,
+            selected_runtime_len = runtime_len,
+            preferred_contract_name = preferred_name,
+            selected_preferred_name = preferred,
+            "Selected direct runtime contract"
+        );
+
+        Ok(runtime)
     }
 
     /// Generate the tweaked runtime bytecode by replaying the creation transaction.

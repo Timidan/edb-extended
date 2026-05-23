@@ -40,6 +40,8 @@ use crate::{
     TraceReplayResult,
 };
 
+const MEZO_TESTNET_CHAIN_ID: u64 = 31_611;
+
 /// Combined inspector that collects both call trace metadata and opcode snapshots
 /// in a single transaction replay.
 #[derive(Debug)]
@@ -292,28 +294,14 @@ where
 {
     info!("Tweaking bytecode");
 
+    let chain_id = ctx.cfg.chain_id;
+    let allow_direct_runtime_tweak = chain_id == MEZO_TESTNET_CHAIN_ID;
     let mut tweaker =
         CodeTweaker::new(ctx, config.rpc_proxy_url.clone(), config.etherscan_api_key.clone());
 
     let mut contracts_in_tx = Vec::new();
 
     for (address, recompiled_artifact) in recompiled_artifacts {
-        let creation_tx_hash = match tweaker.get_creation_tx(address).await {
-            Ok(hash) => hash,
-            Err(e) => {
-                warn!(
-                    "Failed to get creation tx for contract {address}: {e}. \
-                     This contract will use opcode-level traces instead of source-level debugging."
-                );
-                continue;
-            }
-        };
-        if creation_tx_hash == tx_hash {
-            debug!("Skip tweaking contract {}, since it was created by the transaction under investigation", address);
-            contracts_in_tx.push(*address);
-            continue;
-        }
-
         let artifact = match artifacts.get(address) {
             Some(a) => a,
             None => {
@@ -324,6 +312,39 @@ where
                 continue;
             }
         };
+
+        let creation_tx_hash = match tweaker.get_creation_tx(address).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                if allow_direct_runtime_tweak {
+                    warn!(
+                        "Failed to get creation tx for Mezo contract {address}: {e}. \
+                         Falling back to direct runtime bytecode replacement."
+                    );
+                    match tweaker.tweak_deployed_runtime(address, artifact, recompiled_artifact) {
+                        Ok(()) => {}
+                        Err(runtime_err) => {
+                            warn!(
+                                "Direct runtime bytecode replacement failed for contract {address}: \
+                                 {runtime_err}. This contract will use opcode-level traces instead \
+                                 of source-level debugging."
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Failed to get creation tx for contract {address}: {e}. \
+                         This contract will use opcode-level traces instead of source-level debugging."
+                    );
+                }
+                continue;
+            }
+        };
+        if creation_tx_hash == tx_hash {
+            debug!("Skip tweaking contract {}, since it was created by the transaction under investigation", address);
+            contracts_in_tx.push(*address);
+            continue;
+        }
 
         let tweak_result = if config.quick {
             match tweaker.tweak(address, artifact, recompiled_artifact, true).await {
