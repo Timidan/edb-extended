@@ -21,6 +21,7 @@ use edb_common::{fork_and_prepare, types::RenderedTrace};
 use edb_engine::{Engine, EngineConfig};
 use edb_integration_tests::{rpc_test_utils::RpcTestClient, test_utils::init};
 use eyre::Result;
+use serde_json::json;
 
 const MEZO_LIVE_TEST_ENV: &str = "EDB_MEZO_LIVE_TEST";
 const MEZO_TESTNET_CHAIN_ID: u64 = 31_611;
@@ -42,15 +43,36 @@ const MEZO_OPEN_TROVE_TX: &str =
     "0xe838ed1eedc762c9b338b45ad96664c18ef9dd90d018e6250791cdcb3004fb5e";
 const MEZO_OPEN_TROVE_BLOCK: u64 = 13_221_805;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mezo_open_trove_live_trace_renders_when_enabled() -> Result<()> {
-    if !matches!(std::env::var(MEZO_LIVE_TEST_ENV).as_deref(), Ok("1")) {
-        eprintln!(
-            "skipping Mezo live fork/replay; set {MEZO_LIVE_TEST_ENV}=1 to use {MEZO_RPC_URL}"
-        );
-        return Ok(());
-    }
+fn mezo_live_enabled() -> bool {
+    matches!(std::env::var(MEZO_LIVE_TEST_ENV).as_deref(), Ok("1"))
+}
 
+fn print_rendered_source_summary(label: &str, tx_hash: TxHash, rendered: &RenderedTrace) {
+    let source_rows = rendered.rows.iter().filter(|row| row.source_file.is_some()).count();
+    eprintln!(
+        "{label}: tx={tx_hash:?} rows={} source_rows={} source_files={}",
+        rendered.rows.len(),
+        source_rows,
+        rendered.source_texts.len()
+    );
+
+    for row in rendered.rows.iter().filter(|row| row.source_file.is_some()).take(12) {
+        eprintln!(
+            "{label}: source frame id={} contract={} fn={} pc={} op={} at {}:{}",
+            row.id,
+            row.contract.as_deref().unwrap_or("<unknown>"),
+            row.function_name.as_deref().unwrap_or("<unknown>"),
+            row.pc,
+            row.name,
+            row.source_file.as_deref().unwrap_or("<unknown>"),
+            row.line.unwrap_or_default()
+        );
+    }
+}
+
+async fn render_mezo_open_trove(
+    config: EngineConfig,
+) -> Result<(Engine, TxHash, RenderedTrace, RpcTestClient)> {
     init::init_test_environment(true);
 
     let tx_hash: TxHash = MEZO_OPEN_TROVE_TX.parse()?;
@@ -58,6 +80,26 @@ async fn mezo_open_trove_live_trace_renders_when_enabled() -> Result<()> {
 
     assert_eq!(fork_result.fork_info.chain_id, MEZO_TESTNET_CHAIN_ID);
     assert_eq!(fork_result.fork_info.block_number, MEZO_OPEN_TROVE_BLOCK);
+
+    let engine = Engine::new(config);
+    let rpc_addr = engine.prepare(fork_result, None, None).await?;
+    let rpc_url = format!("http://{rpc_addr}");
+
+    let client = RpcTestClient::new(&rpc_url);
+    let rendered: RenderedTrace =
+        serde_json::from_value(client.call_raw("edb_getRenderedTrace", None).await?)?;
+
+    Ok((engine, tx_hash, rendered, client))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mezo_open_trove_live_trace_renders_when_enabled() -> Result<()> {
+    if !mezo_live_enabled() {
+        eprintln!(
+            "skipping Mezo live fork/replay; set {MEZO_LIVE_TEST_ENV}=1 to use {MEZO_RPC_URL}"
+        );
+        return Ok(());
+    }
 
     // Keep this smoke scoped to Mezo fork/replay/render behavior. Source
     // retrieval and hook instrumentation depend on explorer/tooling paths and
@@ -69,13 +111,8 @@ async fn mezo_open_trove_live_trace_renders_when_enabled() -> Result<()> {
         .with_collect_hook_snapshots(false)
         .with_precompute_state_variables(false)
         .with_significant_opcode_snapshots_only(true);
-    let engine = Engine::new(config);
-    let rpc_addr = engine.prepare(fork_result, None, None).await?;
-    let rpc_url = format!("http://{rpc_addr}");
-
-    let client = RpcTestClient::new(&rpc_url);
-    let rendered: RenderedTrace =
-        serde_json::from_value(client.call_raw("edb_getRenderedTrace", None).await?)?;
+    let (engine, tx_hash, rendered, _client) = render_mezo_open_trove(config).await?;
+    print_rendered_source_summary("mezo-smoke", tx_hash, &rendered);
 
     assert_eq!(rendered.schema_version, 3);
     assert!(!rendered.rows.is_empty(), "Mezo rendered trace should contain rows");
@@ -83,6 +120,71 @@ async fn mezo_open_trove_live_trace_renders_when_enabled() -> Result<()> {
         !rendered.raw_events.is_empty(),
         "Mezo openTrove smoke transaction should render emitted events"
     );
+
+    engine.shutdown_rpc_server(&tx_hash)?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mezo_open_trove_live_debugger_renders_when_enabled() -> Result<()> {
+    if !mezo_live_enabled() {
+        eprintln!(
+            "skipping Mezo live debugger render; set {MEZO_LIVE_TEST_ENV}=1 to use {MEZO_RPC_URL}"
+        );
+        return Ok(());
+    }
+
+    std::env::set_var("EDB_DEBUG_MAX_SOURCE_CONTRACTS", "24");
+
+    let config = EngineConfig::default()
+        .with_rpc_proxy_url(MEZO_RPC_URL.to_string())
+        .with_quick_mode(false)
+        .with_events_only(false)
+        .with_collect_hook_snapshots(true)
+        .with_precompute_state_variables(true)
+        .with_significant_opcode_snapshots_only(true)
+        .with_artifact_source_priority(vec!["blockscout".to_string()]);
+    let (engine, tx_hash, rendered, client) = render_mezo_open_trove(config).await?;
+    print_rendered_source_summary("mezo-debugger", tx_hash, &rendered);
+
+    assert_eq!(rendered.schema_version, 3);
+    assert!(!rendered.rows.is_empty(), "Mezo rendered trace should contain rows");
+
+    let source_rows = rendered.rows.iter().filter(|row| row.source_file.is_some()).count();
+    assert!(source_rows > 0, "Mezo debugger render should contain source-anchored rows");
+    assert!(
+        rendered.source_texts.keys().any(|path| path.ends_with("MUSD.sol")),
+        "Mezo debugger render should include MUSD.sol source text"
+    );
+    assert!(
+        rendered
+            .rows
+            .iter()
+            .any(|row| row.source_file.as_deref().is_some_and(|path| path.ends_with("MUSD.sol"))),
+        "Mezo debugger render should include source frames anchored to MUSD.sol"
+    );
+
+    let snapshot_count: usize =
+        serde_json::from_value(client.call_raw("edb_getSnapshotCount", None).await?)?;
+    let mut hook_snapshot_path = None;
+    for snapshot_id in 0..snapshot_count {
+        let Ok(info) = client.call_raw("edb_getSnapshotInfo", Some(json!([snapshot_id]))).await
+        else {
+            continue;
+        };
+        if let Some(path) = info
+            .get("detail")
+            .and_then(|detail| detail.get("Hook"))
+            .and_then(|hook| hook.get("path"))
+            .and_then(|path| path.as_str())
+        {
+            hook_snapshot_path = Some((snapshot_id, path.to_string()));
+            break;
+        }
+    }
+    let (hook_snapshot_id, hook_path) =
+        hook_snapshot_path.expect("Mezo debugger run should collect hook snapshots");
+    eprintln!("mezo-debugger: first hook snapshot id={hook_snapshot_id} path={hook_path}");
 
     engine.shutdown_rpc_server(&tx_hash)?;
     Ok(())
