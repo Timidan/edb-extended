@@ -25,21 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Default Ethereum mainnet RPC endpoints
-/// These are free public endpoints from chainlist.org, sorted by latency
-pub const DEFAULT_MAINNET_RPCS: &[&str] = &[
-    "https://rpc.eth.gateway.fm",
-    // "https://ethereum-rpc.publicnode.com", // disable due to publicnode's temporary issues
-    // "https://rpc.flashbots.net/fast", // disable due to flashbots' temporary issues
-    // "https://rpc.flashbots.net", // disable due to flashbots' temporary issues
-    "https://eth-mainnet.public.blastapi.io",
-    "https://ethereum-mainnet.gateway.tatum.io",
-    "https://eth.api.onfinality.io/public",
-    "https://eth.llamarpc.com",
-    "https://api.zan.top/eth-mainnet",
-    "https://eth.drpc.org",
-    "https://ethereum.rpc.subquery.network/public",
-];
+pub use crate::chain_metadata::DEFAULT_MAINNET_RPCS;
 
 /// Information about an RPC provider
 #[derive(Debug, Clone)]

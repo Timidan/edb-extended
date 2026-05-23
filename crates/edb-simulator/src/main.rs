@@ -6,8 +6,10 @@ use alloy_network::AnyNetwork;
 use alloy_primitives::{hex, keccak256, Address, Bytes, TxHash, TxKind, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use edb_common::{
-    fork_and_prepare, get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id,
-    relax_evm_constraints, EdbDB, ForkInfo, ForkResult,
+    default_rpc_for_chain, fork_and_prepare, get_blob_base_fee_update_fraction_by_spec_id,
+    get_mainnet_spec_id, infer_spec_from_block_header, is_mezo_precompile_address, is_mezo_testnet,
+    relax_evm_constraints, EdbDB, ForkInfo, ForkResult, MezoPrecompileMockInspector,
+    MEZO_GAS_WARNING, MEZO_PRECOMPILE_WARNING,
 };
 use edb_engine::{find_or_install_solc, Artifact, CallTracer, Engine, EngineConfig};
 use eyre::WrapErr;
@@ -33,8 +35,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Error)]
@@ -223,6 +225,109 @@ fn env_flag(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+fn append_warning_once(warnings: &mut Vec<String>, warning: &str) {
+    if !warnings.iter().any(|existing| existing == warning) {
+        warnings.push(warning.to_string());
+    }
+}
+
+fn finalize_chain_annotations(
+    chain_id: u64,
+    raw_trace: &mut Option<Value>,
+    rendered_trace: &mut Option<Value>,
+    mut warnings: Vec<String>,
+) -> Vec<String> {
+    if !is_mezo_testnet(chain_id) {
+        return warnings;
+    }
+
+    append_warning_once(&mut warnings, MEZO_GAS_WARNING);
+    let raw_touched = annotate_mezo_raw_trace(raw_trace);
+    let rendered_touched = annotate_mezo_rendered_trace(rendered_trace);
+    if raw_touched || rendered_touched {
+        append_warning_once(&mut warnings, MEZO_PRECOMPILE_WARNING);
+    }
+    warnings
+}
+
+fn annotate_mezo_raw_trace(raw_trace: &mut Option<Value>) -> bool {
+    let Some(raw_trace) = raw_trace.as_mut() else {
+        return false;
+    };
+    let touched = annotate_mezo_value(raw_trace);
+    if let Some(obj) = raw_trace.as_object_mut() {
+        obj.insert("mezoPrecompileMocked".into(), Value::Bool(touched));
+        if touched {
+            obj.insert(
+                "mezoPrecompileWarning".into(),
+                Value::String(MEZO_PRECOMPILE_WARNING.into()),
+            );
+        }
+    }
+    touched
+}
+
+fn annotate_mezo_rendered_trace(rendered_trace: &mut Option<Value>) -> bool {
+    let Some(rendered_trace) = rendered_trace.as_mut() else {
+        return false;
+    };
+    let touched = annotate_mezo_value(rendered_trace);
+    if let Some(obj) = rendered_trace.as_object_mut() {
+        obj.insert("mezoPrecompileMocked".into(), Value::Bool(touched));
+        if touched {
+            obj.insert(
+                "mezoPrecompileWarning".into(),
+                Value::String(MEZO_PRECOMPILE_WARNING.into()),
+            );
+        }
+    }
+    touched
+}
+
+fn annotate_mezo_value(value: &mut Value) -> bool {
+    match value {
+        Value::Object(obj) => {
+            let mut touched = object_references_mezo_precompile(obj);
+
+            if touched {
+                obj.entry("targetLabel")
+                    .or_insert_with(|| Value::String("MEZO precompile mocked".into()));
+                obj.entry("contract")
+                    .or_insert_with(|| Value::String("MEZO precompile mocked".into()));
+
+                if let Some(entry_meta) = obj.get_mut("entryMeta").and_then(Value::as_object_mut) {
+                    entry_meta
+                        .entry("targetContractName")
+                        .or_insert_with(|| Value::String("MEZO precompile mocked".into()));
+                    entry_meta
+                        .entry("codeContractName")
+                        .or_insert_with(|| Value::String("MEZO precompile mocked".into()));
+                }
+            }
+
+            for child in obj.values_mut() {
+                touched |= annotate_mezo_value(child);
+            }
+            touched
+        }
+        Value::Array(values) => {
+            values.iter_mut().fold(false, |touched, child| annotate_mezo_value(child) || touched)
+        }
+        Value::String(value) => is_mezo_address_string(value),
+        _ => false,
+    }
+}
+
+fn object_references_mezo_precompile(obj: &Map<String, Value>) -> bool {
+    ["target", "codeAddress", "code_address", "address", "to"]
+        .iter()
+        .any(|key| obj.get(*key).and_then(Value::as_str).is_some_and(is_mezo_address_string))
+}
+
+fn is_mezo_address_string(value: &str) -> bool {
+    Address::from_str(value).is_ok_and(is_mezo_precompile_address)
 }
 
 #[tokio::main]
@@ -1529,7 +1634,12 @@ fn enrich_opcodes_with_lines(
 async fn run(keep_alive: bool) -> Result<(), SimulatorError> {
     let mut buffer = String::new();
     io::stdin().read_to_string(&mut buffer)?;
-    let job: SimulationJob = serde_json::from_str(&buffer)?;
+    let mut job: SimulationJob = serde_json::from_str(&buffer)?;
+    if job.rpc_url.trim().is_empty() {
+        if let Some(default_rpc) = default_rpc_for_chain(job.chain_id) {
+            job.rpc_url = default_rpc.to_string();
+        }
+    }
 
     info!("received simulation request (mode: {:?})", job.mode);
 
@@ -1578,6 +1688,7 @@ async fn simulate_onchain(
     let fork_result = fork_and_prepare(&job.rpc_url, tx_hash, quick_mode)
         .await
         .map_err(|e| SimulatorError::Engine(format!("fork_and_prepare failed: {e:?}")))?;
+    let effective_chain_id = fork_result.fork_info.chain_id;
     info!("[TIMING] fork_and_prepare (main tx): {:.2}s", fork_start.elapsed().as_secs_f64());
 
     let gas_limit_suggested = Some(fork_result.target_tx_env.gas_limit.to_string());
@@ -1682,7 +1793,7 @@ async fn simulate_onchain(
 
         // Fetch rendered trace (fully decoded rows from Rust engine)
         let render_start = std::time::Instant::now();
-        let rendered_trace: Option<Value> =
+        let mut rendered_trace: Option<Value> =
             match call_edb_rpc(&client, &rpc_url, "edb_getRenderedTrace", json!([])).await {
                 Ok(v) => {
                     info!(
@@ -1704,7 +1815,7 @@ async fn simulate_onchain(
         let mut enriched_trace = enrich_trace_payload(
             &client,
             &rpc_url,
-            job.chain_id,
+            effective_chain_id,
             trace_value,
             provided_artifacts.as_ref(),
             keep_alive, // lazy_snapshots = true when keep_alive is enabled
@@ -1714,10 +1825,11 @@ async fn simulate_onchain(
         if let Some(ref rendered) = rendered_trace {
             backfill_storage_diffs_from_rendered_trace(&mut enriched_trace, rendered);
         }
+        let mut raw_trace = Some(enriched_trace);
         info!("[TIMING] enrich_trace_payload: {:.2}s", enrich_start.elapsed().as_secs_f64());
 
         if let Some(g) = gas_used {
-            if let Some(obj) = enriched_trace.as_object_mut() {
+            if let Some(obj) = raw_trace.as_mut().and_then(Value::as_object_mut) {
                 obj.insert("gasUsed".into(), Value::String(g.to_string()));
             }
         }
@@ -1736,15 +1848,22 @@ async fn simulate_onchain(
 
         info!("[TIMING] simulate_onchain TOTAL: {:.2}s", simulation_start.elapsed().as_secs_f64());
 
+        let warnings = finalize_chain_annotations(
+            effective_chain_id,
+            &mut raw_trace,
+            &mut rendered_trace,
+            Vec::new(),
+        );
+
         Ok::<SimulationResult, SimulatorError>(SimulationResult {
             mode: SimulationMode::Onchain,
             success,
             error: None,
-            warnings: Vec::new(),
+            warnings,
             revert_reason,
             gas_used: gas_used.map(|g| g.to_string()),
             gas_limit_suggested,
-            raw_trace: Some(enriched_trace),
+            raw_trace,
             rendered_trace,
             debug_session,
             debug_level: Some(DebugLevel::SourceInstrumented),
@@ -1844,7 +1963,17 @@ async fn simulate_local_with_engine(
     };
 
     let block_number_u64 = block.header.number;
-    let spec_id = get_mainnet_spec_id(block_number_u64);
+    let spec_id = if chain_id == 1 {
+        get_mainnet_spec_id(block_number_u64)
+    } else {
+        infer_spec_from_block_header(
+            block.header.base_fee_per_gas,
+            block.header.excess_blob_gas,
+            block.header.difficulty,
+            block.header.withdrawals_root,
+            block.header.requests_hash,
+        )
+    };
 
     let fork_info = ForkInfo {
         block_number: block_number_u64,
@@ -2006,7 +2135,7 @@ async fn simulate_local_with_engine(
     let result = async {
         // Fetch rendered trace (fully decoded rows from Rust engine)
         let render_start = std::time::Instant::now();
-        let rendered_trace: Option<Value> =
+        let mut rendered_trace: Option<Value> =
             match call_edb_rpc(&client, &rpc_url, "edb_getRenderedTrace", json!([])).await {
                 Ok(v) => {
                     info!(
@@ -2074,6 +2203,7 @@ async fn simulate_local_with_engine(
         if let Some(ref rendered) = rendered_trace {
             backfill_storage_diffs_from_rendered_trace(&mut enriched_trace, rendered);
         }
+        let mut raw_trace = Some(enriched_trace);
 
         // Include debug session info when keep_alive is enabled
         let debug_session = if keep_alive {
@@ -2087,15 +2217,18 @@ async fn simulate_local_with_engine(
             None
         };
 
+        let warnings =
+            finalize_chain_annotations(chain_id, &mut raw_trace, &mut rendered_trace, Vec::new());
+
         Ok::<SimulationResult, SimulatorError>(SimulationResult {
             mode: SimulationMode::Local,
             success,
             error: None,
-            warnings: Vec::new(),
+            warnings,
             revert_reason,
             gas_used,
             gas_limit_suggested,
-            raw_trace: Some(enriched_trace),
+            raw_trace,
             rendered_trace,
             debug_session,
             debug_level: Some(DebugLevel::SourceInstrumented),
@@ -2141,16 +2274,24 @@ async fn simulate_local_fallback(
         Ok(val) => val,
         Err(err) => {
             let message = err.to_string();
+            let mut raw_trace = None;
+            let mut rendered_trace = None;
+            let warnings = finalize_chain_annotations(
+                job.chain_id,
+                &mut raw_trace,
+                &mut rendered_trace,
+                vec![fallback_warning],
+            );
             return Ok(SimulationResult {
                 mode: SimulationMode::Local,
                 success: false,
                 error: Some(message.clone()),
-                warnings: vec![fallback_warning],
+                warnings,
                 revert_reason: Some(message),
                 gas_used: None,
                 gas_limit_suggested: None,
-                raw_trace: None,
-                rendered_trace: None,
+                raw_trace,
+                rendered_trace,
                 debug_session: None,
                 debug_level: Some(DebugLevel::EthCallOnly),
             });
@@ -2174,16 +2315,24 @@ async fn simulate_local_fallback(
     match call_response {
         Ok(data) => {
             raw_map.insert("returnData".into(), Value::String(data.clone()));
+            let mut raw_trace = Some(Value::Object(raw_map));
+            let mut rendered_trace = None;
+            let warnings = finalize_chain_annotations(
+                job.chain_id,
+                &mut raw_trace,
+                &mut rendered_trace,
+                vec![fallback_warning],
+            );
             Ok(SimulationResult {
                 mode: SimulationMode::Local,
                 success: true,
                 error: None,
-                warnings: vec![fallback_warning],
+                warnings,
                 revert_reason: None,
                 gas_used: Some(gas_estimate_decimal.to_string()),
                 gas_limit_suggested: Some(suggested_limit.to_string()),
-                raw_trace: Some(Value::Object(raw_map)),
-                rendered_trace: None,
+                raw_trace,
+                rendered_trace,
                 debug_session: None,
                 debug_level: Some(DebugLevel::EthCallOnly),
             })
@@ -2191,16 +2340,24 @@ async fn simulate_local_fallback(
         Err(err) => {
             let message = err.to_string();
             raw_map.insert("error".into(), Value::String(message.clone()));
+            let mut raw_trace = Some(Value::Object(raw_map));
+            let mut rendered_trace = None;
+            let warnings = finalize_chain_annotations(
+                job.chain_id,
+                &mut raw_trace,
+                &mut rendered_trace,
+                vec![fallback_warning],
+            );
             Ok(SimulationResult {
                 mode: SimulationMode::Local,
                 success: false,
                 error: Some(message.clone()),
-                warnings: vec![fallback_warning],
+                warnings,
                 revert_reason: Some(message),
                 gas_used: Some(gas_estimate_decimal.to_string()),
                 gas_limit_suggested: Some(suggested_limit.to_string()),
-                raw_trace: Some(Value::Object(raw_map)),
-                rendered_trace: None,
+                raw_trace,
+                rendered_trace,
                 debug_session: None,
                 debug_level: Some(DebugLevel::EthCallOnly),
             })
@@ -2252,7 +2409,17 @@ async fn simulate_local_lightweight(
     };
 
     let block_number_u64 = block.header.number;
-    let spec_id = get_mainnet_spec_id(block_number_u64);
+    let spec_id = if chain_id == 1 {
+        get_mainnet_spec_id(block_number_u64)
+    } else {
+        infer_spec_from_block_header(
+            block.header.base_fee_per_gas,
+            block.header.excess_blob_gas,
+            block.header.difficulty,
+            block.header.withdrawals_root,
+            block.header.requests_hash,
+        )
+    };
 
     // Determine state block based on whether user specified a specific block number
     // When replaying a historical tx in block N, we need state at end of block N-1
@@ -2307,7 +2474,7 @@ async fn simulate_local_lightweight(
         });
 
     // Set up CallTracer and run with inspector
-    let mut tracer = CallTracer::new();
+    let mut tracer = (CallTracer::new(), MezoPrecompileMockInspector);
     tx_env.chain_id = Some(chain_id);
 
     // Build EVM with tracer
@@ -2331,7 +2498,8 @@ async fn simulate_local_lightweight(
     };
 
     // Build trace from CallTracer and set total gas used
-    let mut replay_result = tracer.into_replay_result();
+    drop(evm);
+    let mut replay_result = tracer.0.into_replay_result();
     // Set total_gas_used from ExecutionResult (includes refunds)
     replay_result.execution_trace.set_total_gas_used(gas_used);
     let trace_json = serde_json::to_value(&replay_result.execution_trace)
@@ -2340,16 +2508,21 @@ async fn simulate_local_lightweight(
     let warning =
         format!("Lightweight trace mode (source instrumentation unavailable: {})", engine_error);
 
+    let mut raw_trace = Some(trace_json);
+    let mut rendered_trace = None;
+    let warnings =
+        finalize_chain_annotations(chain_id, &mut raw_trace, &mut rendered_trace, vec![warning]);
+
     Ok(SimulationResult {
         mode: SimulationMode::Local,
         success,
         error: None,
-        warnings: vec![warning],
+        warnings,
         revert_reason,
         gas_used: Some(gas_used.to_string()),
         gas_limit_suggested: Some((gas_used.saturating_mul(120) / 100).to_string()),
-        raw_trace: Some(trace_json),
-        rendered_trace: None,
+        raw_trace,
+        rendered_trace,
         debug_session: None,
         debug_level: Some(DebugLevel::CallTrace),
     })
@@ -2836,14 +3009,9 @@ async fn enrich_trace_payload(
             // the bridge can read it at artifact.storageLayout.
             if let Some(contracts) = output.get("contracts").and_then(Value::as_object) {
                 // Prefer matching the contract name from meta if available
-                let meta_name = artifact
-                    .get("meta")
-                    .and_then(Value::as_object)
-                    .and_then(|m| {
-                        m.get("ContractName")
-                            .or_else(|| m.get("Name"))
-                            .and_then(Value::as_str)
-                    });
+                let meta_name = artifact.get("meta").and_then(Value::as_object).and_then(|m| {
+                    m.get("ContractName").or_else(|| m.get("Name")).and_then(Value::as_str)
+                });
 
                 let mut found_layout: Option<&Value> = None;
 
@@ -2965,10 +3133,8 @@ async fn enrich_trace_payload(
                     continue;
                 }
                 // Check if existing artifact (from Sourcify) has source maps
-                let existing_has_srcmaps = artifacts_obj
-                    .get(&addr_lower)
-                    .map(has_source_maps)
-                    .unwrap_or(false);
+                let existing_has_srcmaps =
+                    artifacts_obj.get(&addr_lower).map(has_source_maps).unwrap_or(false);
                 let engine_has_srcmaps = has_source_maps(artifact);
                 let has_output_contracts =
                     artifact.get("output").and_then(|o| o.get("contracts")).is_some();
@@ -3041,10 +3207,8 @@ async fn enrich_trace_payload(
                     continue;
                 }
                 let addr_lower = addr.to_lowercase();
-                let existing_has_srcmaps = merged
-                    .get(&addr_lower)
-                    .map(has_source_maps)
-                    .unwrap_or(false);
+                let existing_has_srcmaps =
+                    merged.get(&addr_lower).map(has_source_maps).unwrap_or(false);
                 if existing_has_srcmaps {
                     // Keep the original artifact when it already has source maps.
                     // Runtime opcode snapshots are captured before bytecode tweak in most flows,
@@ -3355,8 +3519,7 @@ fn preload_artifacts_from_job(
     let compile_results: Vec<(Address, String, Result<Artifact, eyre::Error>)> = compile_tasks
         .into_par_iter()
         .map(|(address, addr_str, artifact_json, input_obj, settings_json)| {
-            let artifact =
-                build_artifact_from_json(&artifact_json, &input_obj, &settings_json);
+            let artifact = build_artifact_from_json(&artifact_json, &input_obj, &settings_json);
             (address, addr_str, artifact)
         })
         .collect();
@@ -3993,9 +4156,7 @@ fn analyze_trace(trace_value: &Value) -> (bool, Option<String>) {
         return (true, None);
     };
 
-    let root = array
-        .iter()
-        .find(|entry| entry.get("parent_id").is_none_or(Value::is_null));
+    let root = array.iter().find(|entry| entry.get("parent_id").is_none_or(Value::is_null));
 
     let Some(root_entry) = root else {
         return (true, None);

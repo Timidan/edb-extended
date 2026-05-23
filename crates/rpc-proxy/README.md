@@ -238,7 +238,8 @@ edb-rpc-proxy monitor https://your-proxy.example.com:8546
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--port` | `8546` | HTTP server listening port |
-| `--rpc-urls` | *13 public RPCs* | Comma-separated upstream RPC endpoints |
+| `--rpc-urls` | *built-in mainnet pool* | Comma-separated upstream RPC endpoints |
+| `--chain-id` | `1` | Selects a built-in provider pool when `--rpc-urls` is omitted |
 
 ### Cache Configuration
 
@@ -610,20 +611,11 @@ The proxy uses a sophisticated weighted selection system:
 3. **Error Consensus**: Returns error only when multiple unique providers agree
 4. **Automatic Recovery**: Failed providers restored when healthy
 
-### Default Provider Pool (13 endpoints)
-- rpc.eth.gateway.fm
-- ethereum-rpc.publicnode.com
-- mainnet.gateway.tenderly.co
-- rpc.flashbots.net/fast
-- rpc.flashbots.net
-- gateway.tenderly.co/public/mainnet
-- eth-mainnet.public.blastapi.io
-- ethereum-mainnet.gateway.tatum.io
-- eth.api.onfinality.io/public
-- eth.llamarpc.com
-- api.zan.top/eth-mainnet
-- eth.drpc.org
-- ethereum.rpc.subquery.network/public
+### Built-In Provider Pools
+Built-in pools are used only when `--rpc-urls` is omitted.
+
+- Ethereum mainnet (`--chain-id 1`, native ETH with 18 decimals)
+- Mezo testnet (`--chain-id 31611`, native BTC with 18 decimals): `https://rpc.test.mezo.org`
 
 ## 🛠️ Development
 

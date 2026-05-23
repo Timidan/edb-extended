@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, Bytes};
-use edb_common::{relax_evm_constraints, types::Trace, EdbContext};
+use edb_common::{relax_evm_constraints, types::Trace, EdbContext, MezoPrecompileMockInspector};
 use eyre::Result;
 use foundry_compilers::artifacts::Contract;
 use revm::{
@@ -48,15 +48,17 @@ where
 {
     info!("Collecting opcode-level step execution results");
 
-    let mut inspector = OpcodeSnapshotInspector::new(&ctx);
-    inspector.with_excluded_addresses(excluded_addresses);
-    inspector.with_significant_only(significant_only);
+    let mut opcode_inspector = OpcodeSnapshotInspector::new(&ctx);
+    opcode_inspector.with_excluded_addresses(excluded_addresses);
+    opcode_inspector.with_significant_only(significant_only);
+    let mut inspector = (opcode_inspector, MezoPrecompileMockInspector);
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     evm.inspect_one_tx(tx)
         .map_err(|e| eyre::eyre!("Failed to inspect the target transaction: {:?}", e))?;
 
-    let snapshots = inspector.into_snapshots();
+    drop(evm);
+    let snapshots = inspector.0.into_snapshots();
 
     // Disabled: causes stdout pollution for simulator
     // snapshots.print_summary();
@@ -108,14 +110,16 @@ where
 
     info!("Collecting hook snapshots for source code contracts");
 
-    let mut inspector = HookSnapshotInspector::new(&ctx, trace, analysis_results);
-    inspector.with_creation_hooks(creation_hooks)?;
+    let mut hook_inspector = HookSnapshotInspector::new(&ctx, trace, analysis_results);
+    hook_inspector.with_creation_hooks(creation_hooks)?;
+    let mut inspector = (hook_inspector, MezoPrecompileMockInspector);
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     evm.inspect_one_tx(tx)
         .map_err(|e| eyre::eyre!("Failed to inspect the target transaction: {:?}", e))?;
 
-    let snapshots = inspector.into_snapshots();
+    drop(evm);
+    let snapshots = inspector.0.into_snapshots();
 
     // Disabled: causes stdout pollution for simulator
     // snapshots.print_summary();

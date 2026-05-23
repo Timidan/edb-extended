@@ -75,6 +75,15 @@ The `RPC_ENDPOINTS` should be a comma-separated list of RPC endpoint URLs.
 EDB will utilize the RPC endpoints to obtain on-chain states to replay the transaction.
 The more RPC endpoints are provided, the faster the replay is.
 __If none is provided, EDB will default to the ten most popular public RPC endpoints, which may be slow and unreliable.__
+For Mezo testnet, use `--rpc-urls https://rpc.test.mezo.org` (chain id `31611`, native BTC with 18 decimals). The standalone proxy also supports `edb-rpc-proxy server --chain-id 31611`.
+
+### Mezo testnet replay notes
+
+Mezo testnet is supported as a local revm replay target without relying on `debug_traceCall`. EDB forks Mezo state through standard `eth_*` RPC methods from `https://rpc.test.mezo.org` and replays the transaction locally for opcode-level traces, call trees, storage diffs, and revert reasons.
+
+Mezo's native MEZO ERC-20 facade at `0x7B7c000000000000000000000000000000000001` is backed by the Cosmos bank module, not by normal EVM bytecode. EDB mocks this facade during local replay with optimistic ERC-20 responses (`balanceOf`/`allowance`/`totalSupply` return large synthetic balances, `approve`/`transfer`/`transferFrom` succeed). Traces that touch it are annotated with `MEZO precompile mocked` so users can distinguish mocked native-token behavior from regular contract execution.
+
+Gas displays on Mezo are approximate because the Cosmos EVM gas and refund model is configurable. State outputs from local replay remain the reliable part of the debugger surface.
 
 EDB will by default start a TUI debugger:
 <p align="center">

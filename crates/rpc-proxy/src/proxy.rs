@@ -18,9 +18,12 @@
 
 use crate::{
     cache::CacheManager,
+    chain_metadata::{
+        chain_metadata_by_id, supported_default_chain_ids, ETHEREUM_MAINNET_CHAIN_ID,
+    },
     health::HealthService,
     metrics::MetricsCollector,
-    providers::{ProviderManager, DEFAULT_MAINNET_RPCS},
+    providers::ProviderManager,
     registry::EdbRegistry,
     rpc::RpcHandler,
 };
@@ -42,6 +45,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct ProxyServerBuilder {
     rpc_urls: Option<Vec<String>>,
+    chain_id: Option<u64>,
     max_cache_items: u32,
     cache_dir: Option<PathBuf>,
     grace_period: u64,
@@ -55,7 +59,8 @@ impl Default for ProxyServerBuilder {
     fn default() -> Self {
         Self {
             // General Configuration
-            rpc_urls: None, // Will use DEFAULT_MAINNET_RPCS
+            rpc_urls: None, // Will use built-in defaults for chain_id, or mainnet if unset.
+            chain_id: None,
 
             // Cache Configuration
             max_cache_items: 1024000,
@@ -90,6 +95,12 @@ impl ProxyServerBuilder {
     pub fn rpc_urls_str(mut self, urls: &str) -> Self {
         self.rpc_urls =
             Some(urls.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+        self
+    }
+
+    /// Set the chain id used to select built-in RPC defaults when custom RPC URLs are not set.
+    pub fn chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
         self
     }
 
@@ -138,9 +149,28 @@ impl ProxyServerBuilder {
     /// Build the ProxyServer with the configured settings
     pub async fn build(self) -> Result<ProxyServer> {
         // Resolve RPC URLs
-        let rpc_urls = self
-            .rpc_urls
-            .unwrap_or_else(|| DEFAULT_MAINNET_RPCS.iter().map(|s| s.to_string()).collect());
+        let rpc_urls = match self.rpc_urls {
+            Some(urls) => urls,
+            None => {
+                let chain_id = self.chain_id.unwrap_or(ETHEREUM_MAINNET_CHAIN_ID);
+                let metadata = chain_metadata_by_id(chain_id).ok_or_else(|| {
+                    eyre::eyre!(
+                        "No built-in RPC defaults for chain id {chain_id}. \
+                         Provide --rpc-urls or use one of: {}",
+                        supported_default_chain_ids()
+                    )
+                })?;
+
+                info!(
+                    "Using built-in RPC defaults for {} (chain id {}, native {} with {} decimals)",
+                    metadata.name,
+                    metadata.chain_id,
+                    metadata.native_token_symbol,
+                    metadata.native_token_decimals
+                );
+                metadata.default_rpc_urls.iter().map(|s| s.to_string()).collect()
+            }
+        };
 
         // Resolve cache path
         let cache_path = CacheManager::get_cache_path(&rpc_urls, self.cache_dir).await?;

@@ -38,6 +38,8 @@ pub mod forking;
 pub mod logging;
 /// Conditional assertion macros for strict testing mode
 pub mod macros;
+/// Mezo testnet chain constants and local precompile replay helpers
+pub mod mezo;
 /// Extended opcode analysis utilities for EVM state modification detection and debugging
 pub mod opcode;
 /// Progress message types for tracking operation progress
@@ -52,6 +54,7 @@ pub use context::*;
 pub use expression::*;
 pub use forking::*;
 pub use logging::*;
+pub use mezo::*;
 pub use opcode::*;
 pub use progress::*;
 pub use spec_id::*;

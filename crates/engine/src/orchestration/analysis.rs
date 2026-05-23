@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, Log, TxHash, U256};
-use edb_common::EdbContext;
+use edb_common::{try_mock_mezo_precompile_call, EdbContext, MezoPrecompileMockInspector};
 use eyre::Result;
 use revm::{
     context::{
@@ -98,6 +98,7 @@ where
         self.call_tracer
             .call(context, inputs)
             .or_else(|| self.opcode_inspector.call(context, inputs))
+            .or_else(|| try_mock_mezo_precompile_call(context, inputs))
     }
 
     fn call_end(
@@ -155,8 +156,8 @@ where
 {
     info!("Replaying transaction to collect call trace and touched addresses");
 
-    let mut tracer = CallTracer::new();
-    let mut evm = ctx.build_mainnet_with_inspector(&mut tracer);
+    let mut inspector = (CallTracer::new(), MezoPrecompileMockInspector);
+    let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     let exec_result = evm
         .inspect_one_tx(tx)
@@ -175,7 +176,8 @@ where
         }
     }
 
-    let mut result = tracer.into_replay_result();
+    drop(evm);
+    let mut result = inspector.0.into_replay_result();
 
     // Set the total gas used on the trace (includes gas refunds from SSTORE, etc.)
     if let Some(gas) = gas_used {

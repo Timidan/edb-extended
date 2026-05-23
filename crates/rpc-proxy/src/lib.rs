@@ -23,6 +23,7 @@
 //! network overhead for multiple debugging sessions.
 
 pub mod cache;
+pub mod chain_metadata;
 pub mod health;
 pub mod metrics;
 pub mod providers;
