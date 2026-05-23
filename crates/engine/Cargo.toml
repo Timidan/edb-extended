@@ -83,3 +83,6 @@ rand.workspace = true
 indicatif.workspace = true
 itertools.workspace = true
 dashmap.workspace = true
+
+[dev-dependencies]
+wiremock = "0.5"

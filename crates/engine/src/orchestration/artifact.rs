@@ -52,6 +52,17 @@ fn get_etherscan_v2_api_url(chain_id: u64) -> Option<String> {
     Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id))
 }
 
+const MEZO_TESTNET_CHAIN_ID: u64 = 31_611;
+const MEZO_TESTNET_BLOCKSCOUT_API_BASE_URL: &str = "https://api.explorer.test.mezo.org/api/v2";
+
+fn blockscout_api_base_url(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        MEZO_TESTNET_CHAIN_ID => Some(MEZO_TESTNET_BLOCKSCOUT_API_BASE_URL),
+        // TODO: Register Mezo mainnet here once its Blockscout API base URL is published.
+        _ => None,
+    }
+}
+
 /// Download and compile verified source code for each contract.
 /// If `preloaded_artifacts` is provided, addresses that already exist in it will be skipped.
 pub async fn download_verified_source_code(
@@ -180,6 +191,7 @@ pub async fn download_verified_source_code(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_ETHERSCAN_CACHE_TTL);
 
+    let blockscout_api_base_url = blockscout_api_base_url(chain_id);
     let first_source_hint =
         config.artifact_source_priority.first().map(|entry| entry.to_ascii_lowercase());
     let has_etherscan_key = !config.get_etherscan_api_key().trim().is_empty();
@@ -191,20 +203,28 @@ pub async fn download_verified_source_code(
         // Sourcify remains the fallback for misses/unsupported contracts.
         None => has_etherscan_key,
     };
-    if let Some(hint) = first_source_hint.as_deref() {
+    if let Some(blockscout_api_base_url) = blockscout_api_base_url {
+        info!(
+            "Using typed Blockscout source fetcher for chain {} at {}",
+            chain_id, blockscout_api_base_url
+        );
+    } else if let Some(hint) = first_source_hint.as_deref() {
         info!(
             "Artifact source priority hint from FE: {} (download order: {} -> {})",
             hint,
             if prefer_etherscan_first { "etherscan" } else { "sourcify" },
             if prefer_etherscan_first { "sourcify" } else { "etherscan" }
         );
+        if hint == "blockscout" {
+            info!(
+                "No typed Blockscout source fetcher configured for chain {}; using existing fallback order",
+                chain_id
+            );
+        }
     } else if has_etherscan_key {
         info!(
             "No artifact source priority hint from FE; defaulting to etherscan-first (API key available)"
         );
-    }
-    if matches!(first_source_hint.as_deref(), Some("blockscout")) {
-        info!("Mapping FE 'blockscout' hint to etherscan-compatible fetch path in engine");
     }
 
     // Create all download futures
@@ -215,13 +235,52 @@ pub async fn download_verified_source_code(
         let compiler = compiler.clone();
         let chain_id = chain_id;
         let prefer_etherscan_first = prefer_etherscan_first;
+        let blockscout_api_base_url = blockscout_api_base_url;
 
         async move {
             let contract_start = Instant::now();
             let short_addr = &address.to_string()[2..10]; // Skip 0x, take 8 chars
             pb.set_message(format!("Downloading: 0x{short_addr}..."));
 
-            let result = if prefer_etherscan_first {
+            let result = if let Some(blockscout_api_base_url) = blockscout_api_base_url {
+                let blockscout_start = Instant::now();
+                match crate::utils::blockscout::fetch_artifact_from_blockscout(
+                    blockscout_api_base_url,
+                    *address,
+                )
+                .await
+                {
+                    Ok(Some(artifact)) => {
+                        info!(
+                            "[TIMING] Contract {} blockscout fetch: {:.2}s",
+                            address,
+                            blockscout_start.elapsed().as_secs_f64()
+                        );
+                        pb.set_message(format!("✅ 0x{short_addr}... blockscout"));
+                        Some(artifact)
+                    }
+                    Ok(None) => {
+                        info!(
+                            "[TIMING] Contract {} blockscout no source: {:.2}s",
+                            address,
+                            blockscout_start.elapsed().as_secs_f64()
+                        );
+                        pb.set_message(format!("⚠️  0x{short_addr}... no source"));
+                        debug!("No Blockscout source code available for contract {}", address);
+                        None
+                    }
+                    Err(e) => {
+                        info!(
+                            "[TIMING] Contract {} blockscout error: {:.2}s",
+                            address,
+                            blockscout_start.elapsed().as_secs_f64()
+                        );
+                        pb.set_message(format!("❌ 0x{short_addr}... failed"));
+                        warn!("Blockscout fetch failed for {}: {:?}", address, e);
+                        None
+                    }
+                }
+            } else if prefer_etherscan_first {
                 let etherscan_start = Instant::now();
                 let mut builder = Client::builder()
                     .with_api_key(api_key.clone())
