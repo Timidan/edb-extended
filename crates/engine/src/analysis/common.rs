@@ -446,7 +446,7 @@ contract SimpleContract {
             swarm_source: String::new(),
         };
 
-        let artifact = Artifact { meta, input, output };
+        let artifact = Artifact { meta, input, output, source_provider: None };
 
         // Run the analysis
         let result = analyze(&artifact).expect("Analysis should succeed");

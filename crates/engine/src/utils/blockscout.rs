@@ -190,7 +190,7 @@ pub async fn fetch_artifact_from_blockscout(
     let meta: EtherscanMetadata =
         serde_json::from_value(synth).context("synthesize blockscout metadata")?;
 
-    Ok(Some(Artifact { meta, input, output }))
+    Ok(Some(Artifact { meta, input, output, source_provider: Some("blockscout".to_string()) }))
 }
 
 fn normalize_compiler_settings(

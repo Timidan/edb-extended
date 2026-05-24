@@ -280,7 +280,7 @@ pub async fn fork_and_prepare(
             c.disable_nonce_check = quick; // Disable nonce check in quick mode
         });
 
-    let mut mezo_precompile_inspector = MezoPrecompileMockInspector;
+    let mut mezo_precompile_inspector = MezoPrecompileMockInspector::default();
     let mut evm = ctx.build_mainnet_with_inspector(&mut mezo_precompile_inspector);
     info!("The evm verision is {}", evm.cfg().spec);
 

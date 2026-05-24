@@ -23,7 +23,10 @@ use std::{
 };
 
 use alloy_primitives::Address;
-use edb_common::{CachePath, EdbCachePath, DEFAULT_ETHERSCAN_CACHE_TTL};
+use edb_common::{
+    CachePath, EdbCachePath, DEFAULT_ETHERSCAN_CACHE_TTL, MEZO_MAINNET_CHAIN_ID,
+    MEZO_TESTNET_CHAIN_ID,
+};
 use eyre::{bail, Result};
 use foundry_block_explorers::Client;
 use futures::future::join_all;
@@ -52,13 +55,13 @@ fn get_etherscan_v2_api_url(chain_id: u64) -> Option<String> {
     Some(format!("https://api.etherscan.io/v2/api?chainid={}", chain_id))
 }
 
-const MEZO_TESTNET_CHAIN_ID: u64 = 31_611;
 const MEZO_TESTNET_BLOCKSCOUT_API_BASE_URL: &str = "https://api.explorer.test.mezo.org/api/v2";
+const MEZO_MAINNET_BLOCKSCOUT_API_BASE_URL: &str = "https://api.explorer.mezo.org/api/v2";
 
 fn blockscout_api_base_url(chain_id: u64) -> Option<&'static str> {
     match chain_id {
         MEZO_TESTNET_CHAIN_ID => Some(MEZO_TESTNET_BLOCKSCOUT_API_BASE_URL),
-        // TODO: Register Mezo mainnet here once its Blockscout API base URL is published.
+        MEZO_MAINNET_CHAIN_ID => Some(MEZO_MAINNET_BLOCKSCOUT_API_BASE_URL),
         _ => None,
     }
 }
@@ -650,7 +653,12 @@ pub fn instrument_and_recompile_source_code(
                         output.contracts.len()
                     );
 
-                    Ok(Artifact { meta, input, output })
+                    Ok(Artifact {
+                        meta,
+                        input,
+                        output,
+                        source_provider: artifact.source_provider.clone(),
+                    })
                 })();
 
                 match &result {

@@ -17,8 +17,9 @@
 //! Built-in chain metadata used for RPC proxy defaults.
 
 use edb_common::{
-    MEZO_TESTNET_CHAIN_ID, MEZO_TESTNET_DEFAULT_RPC, MEZO_TESTNET_NATIVE_DECIMALS,
-    MEZO_TESTNET_NATIVE_SYMBOL,
+    MEZO_MAINNET_CHAIN_ID, MEZO_MAINNET_DEFAULT_RPC, MEZO_MAINNET_NATIVE_DECIMALS,
+    MEZO_MAINNET_NATIVE_SYMBOL, MEZO_TESTNET_CHAIN_ID, MEZO_TESTNET_DEFAULT_RPC,
+    MEZO_TESTNET_NATIVE_DECIMALS, MEZO_TESTNET_NATIVE_SYMBOL,
 };
 
 /// Ethereum mainnet chain id.
@@ -43,6 +44,9 @@ pub const DEFAULT_MAINNET_RPCS: &[&str] = &[
 
 /// Default Mezo testnet RPC endpoints.
 pub const DEFAULT_MEZO_TESTNET_RPCS: &[&str] = &[MEZO_TESTNET_DEFAULT_RPC];
+
+/// Default Mezo mainnet RPC endpoints.
+pub const DEFAULT_MEZO_MAINNET_RPCS: &[&str] = &[MEZO_MAINNET_DEFAULT_RPC];
 
 /// Chain metadata needed to choose built-in RPC defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +85,18 @@ pub const MEZO_TESTNET: ChainMetadata = ChainMetadata {
     default_rpc_urls: DEFAULT_MEZO_TESTNET_RPCS,
 };
 
+/// Mezo mainnet metadata.
+pub const MEZO_MAINNET: ChainMetadata = ChainMetadata {
+    chain_id: MEZO_MAINNET_CHAIN_ID,
+    slug: "mezo",
+    name: "Mezo",
+    native_token_symbol: MEZO_MAINNET_NATIVE_SYMBOL,
+    native_token_decimals: MEZO_MAINNET_NATIVE_DECIMALS,
+    default_rpc_urls: DEFAULT_MEZO_MAINNET_RPCS,
+};
+
 /// Chains that have built-in RPC defaults.
-pub const BUILT_IN_CHAINS: &[ChainMetadata] = &[ETHEREUM_MAINNET, MEZO_TESTNET];
+pub const BUILT_IN_CHAINS: &[ChainMetadata] = &[ETHEREUM_MAINNET, MEZO_TESTNET, MEZO_MAINNET];
 
 /// Returns built-in metadata for a chain id.
 pub fn chain_metadata_by_id(chain_id: u64) -> Option<&'static ChainMetadata> {
@@ -110,5 +124,15 @@ mod tests {
         assert_eq!(metadata.native_token_symbol, "BTC");
         assert_eq!(metadata.native_token_decimals, 18);
         assert_eq!(metadata.default_rpc_urls, DEFAULT_MEZO_TESTNET_RPCS);
+    }
+
+    #[test]
+    fn mezo_mainnet_metadata_is_registered() {
+        let metadata = chain_metadata_by_id(MEZO_MAINNET_CHAIN_ID).unwrap();
+
+        assert_eq!(metadata.slug, "mezo");
+        assert_eq!(metadata.native_token_symbol, "BTC");
+        assert_eq!(metadata.native_token_decimals, 18);
+        assert_eq!(metadata.default_rpc_urls, DEFAULT_MEZO_MAINNET_RPCS);
     }
 }

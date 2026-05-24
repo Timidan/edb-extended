@@ -55,6 +55,9 @@ pub struct Artifact {
     pub input: SolcInput,
     /// Output from the Solidity compiler.
     pub output: CompilerOutput,
+    /// Verification service that supplied this artifact, when known.
+    #[serde(default, rename = "sourceProvider", skip_serializing_if = "Option::is_none")]
+    pub source_provider: Option<String>,
 }
 
 impl Artifact {

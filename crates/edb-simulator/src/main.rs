@@ -7,7 +7,7 @@ use alloy_primitives::{hex, keccak256, Address, Bytes, TxHash, TxKind, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use edb_common::{
     default_rpc_for_chain, fork_and_prepare, get_blob_base_fee_update_fraction_by_spec_id,
-    get_mainnet_spec_id, infer_spec_from_block_header, is_mezo_precompile_address, is_mezo_testnet,
+    get_mainnet_spec_id, infer_spec_from_block_header, is_mezo_chain, is_mezo_precompile_address,
     relax_evm_constraints, EdbDB, ForkInfo, ForkResult, MezoPrecompileMockInspector,
     MEZO_GAS_WARNING, MEZO_PRECOMPILE_WARNING,
 };
@@ -239,7 +239,7 @@ fn finalize_chain_annotations(
     rendered_trace: &mut Option<Value>,
     mut warnings: Vec<String>,
 ) -> Vec<String> {
-    if !is_mezo_testnet(chain_id) {
+    if !is_mezo_chain(chain_id) {
         return warnings;
     }
 
@@ -2474,7 +2474,7 @@ async fn simulate_local_lightweight(
         });
 
     // Set up CallTracer and run with inspector
-    let mut tracer = (CallTracer::new(), MezoPrecompileMockInspector);
+    let mut tracer = (CallTracer::new(), MezoPrecompileMockInspector::default());
     tx_env.chain_id = Some(chain_id);
 
     // Build EVM with tracer
@@ -2964,6 +2964,15 @@ async fn enrich_trace_payload(
 
         if let Some(meta) = artifact.get("meta") {
             compact.insert("meta".into(), meta.clone());
+        }
+
+        // Preserve the source-of-truth label (blockscout / sourcify / etherscan)
+        // so the UI can render the right verification badge. Without this,
+        // compaction strips the field set by the engine fetchers.
+        if let Some(provider) = artifact.get("sourceProvider").or_else(|| artifact.get("source")) {
+            if provider.is_string() {
+                compact.insert("sourceProvider".into(), provider.clone());
+            }
         }
 
         if let Some(input) = artifact.get("input").and_then(Value::as_object) {
@@ -3649,7 +3658,14 @@ fn build_artifact_from_json(
     let metadata: EtherscanMetadata = serde_json::from_value(synth)
         .map_err(|e| eyre::eyre!("failed to synthesize metadata: {}", e))?;
 
-    Ok(Artifact { meta: metadata, input, output })
+    let source_provider = artifact_json
+        .get("sourceProvider")
+        .or_else(|| artifact_json.get("source"))
+        .and_then(Value::as_str)
+        .filter(|source| matches!(*source, "sourcify" | "etherscan" | "blockscout"))
+        .map(str::to_string);
+
+    Ok(Artifact { meta: metadata, input, output, source_provider })
 }
 
 /// Recursively gather code addresses from the trace JSON
@@ -3976,6 +3992,7 @@ async fn fetch_sourcify_metadata(chain_id: u64, addr: &str) -> Option<Value> {
         // Since we can't compile in the simulator (no solc), return what we have
         // with the sources in the right format for the traceDecoder to parse
         let artifact = json!({
+            "sourceProvider": "sourcify",
             "input": {
                 "sources": source_entries,
                 "settings": metadata_json.get("settings").cloned().unwrap_or(Value::Null)

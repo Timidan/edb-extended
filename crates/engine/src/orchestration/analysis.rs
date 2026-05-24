@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, Log, TxHash, U256};
-use edb_common::{try_mock_mezo_precompile_call, EdbContext, MezoPrecompileMockInspector};
+use edb_common::{is_mezo_chain, EdbContext, MezoPrecompileMockInspector};
 use eyre::Result;
 use revm::{
     context::{
@@ -40,8 +40,6 @@ use crate::{
     TraceReplayResult,
 };
 
-const MEZO_TESTNET_CHAIN_ID: u64 = 31_611;
-
 /// Combined inspector that collects both call trace metadata and opcode snapshots
 /// in a single transaction replay.
 #[derive(Debug)]
@@ -53,6 +51,7 @@ where
 {
     call_tracer: CallTracer,
     opcode_inspector: OpcodeSnapshotInspector<DB>,
+    mezo_precompile_inspector: MezoPrecompileMockInspector,
 }
 
 impl<DB> ReplayWithOpcodeInspector<DB>
@@ -69,7 +68,11 @@ where
         let mut opcode_inspector = OpcodeSnapshotInspector::new(ctx);
         opcode_inspector.with_excluded_addresses(excluded_addresses);
         opcode_inspector.with_significant_only(significant_only);
-        Self { call_tracer: CallTracer::new(), opcode_inspector }
+        Self {
+            call_tracer: CallTracer::new(),
+            opcode_inspector,
+            mezo_precompile_inspector: MezoPrecompileMockInspector::default(),
+        }
     }
 
     fn into_parts(self) -> (TraceReplayResult, OpcodeSnapshots<DB>) {
@@ -100,7 +103,7 @@ where
         self.call_tracer
             .call(context, inputs)
             .or_else(|| self.opcode_inspector.call(context, inputs))
-            .or_else(|| try_mock_mezo_precompile_call(context, inputs))
+            .or_else(|| self.mezo_precompile_inspector.call(context, inputs))
     }
 
     fn call_end(
@@ -158,7 +161,7 @@ where
 {
     info!("Replaying transaction to collect call trace and touched addresses");
 
-    let mut inspector = (CallTracer::new(), MezoPrecompileMockInspector);
+    let mut inspector = (CallTracer::new(), MezoPrecompileMockInspector::default());
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     let exec_result = evm
@@ -295,7 +298,7 @@ where
     info!("Tweaking bytecode");
 
     let chain_id = ctx.cfg.chain_id;
-    let allow_direct_runtime_tweak = chain_id == MEZO_TESTNET_CHAIN_ID;
+    let allow_direct_runtime_tweak = is_mezo_chain(chain_id);
     let mut tweaker =
         CodeTweaker::new(ctx, config.rpc_proxy_url.clone(), config.etherscan_api_key.clone());
 

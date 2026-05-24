@@ -119,7 +119,12 @@ impl OnchainCompiler {
 
             // compile the source code
             let output = match compiler.compile_exact(&input) {
-                Ok(output) => Some(Artifact { meta, input, output }),
+                Ok(output) => Some(Artifact {
+                    meta,
+                    input,
+                    output,
+                    source_provider: Some("etherscan".to_string()),
+                }),
                 Err(_) if version.major == 0 && version.minor == 4 => None,
                 Err(e) => {
                     return Err(eyre::eyre!("failed to compile contract: {}", e));

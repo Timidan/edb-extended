@@ -51,7 +51,7 @@ where
     let mut opcode_inspector = OpcodeSnapshotInspector::new(&ctx);
     opcode_inspector.with_excluded_addresses(excluded_addresses);
     opcode_inspector.with_significant_only(significant_only);
-    let mut inspector = (opcode_inspector, MezoPrecompileMockInspector);
+    let mut inspector = (opcode_inspector, MezoPrecompileMockInspector::default());
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     evm.inspect_one_tx(tx)
@@ -112,7 +112,7 @@ where
 
     let mut hook_inspector = HookSnapshotInspector::new(&ctx, trace, analysis_results);
     hook_inspector.with_creation_hooks(creation_hooks)?;
-    let mut inspector = (hook_inspector, MezoPrecompileMockInspector);
+    let mut inspector = (hook_inspector, MezoPrecompileMockInspector::default());
     let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     evm.inspect_one_tx(tx)
