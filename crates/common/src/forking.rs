@@ -18,7 +18,10 @@
 //!
 //! This module provides ACTUAL REVM TRANSACTION EXECUTION with transact_commit()
 
-use crate::{get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id, infer_spec_from_block_header, EdbContext, EdbDB};
+use crate::{
+    get_blob_base_fee_update_fraction_by_spec_id, get_mainnet_spec_id,
+    infer_spec_from_block_header, EdbContext, EdbDB, MezoPrecompileMockInspector,
+};
 use alloy_network::{AnyNetwork, AnyRpcTransaction, TransactionResponse};
 use alloy_primitives::{address, Address, TxHash, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -29,7 +32,7 @@ use revm::{
     context::{ContextTr, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
     database::{AlloyDB, CacheDB},
-    Context, Database, DatabaseCommit, DatabaseRef, ExecuteCommitEvm, ExecuteEvm, MainBuilder,
+    Context, Database, DatabaseCommit, DatabaseRef, ExecuteEvm, InspectCommitEvm, MainBuilder,
     MainContext,
 };
 use serde::{Deserialize, Serialize};
@@ -212,7 +215,8 @@ pub async fn fork_and_prepare(
         )
     };
     info!("Block {} is under {:?} hardfork", target_block_number, spec_id);
-    let evm_version_label = if chain_id == 1 { "mainnet block-number mapping" } else { "block header inference" };
+    let evm_version_label =
+        if chain_id == 1 { "mainnet block-number mapping" } else { "block header inference" };
     info!("The evm verision is {:?} (detected via {})", spec_id, evm_version_label);
 
     // Create fork info
@@ -276,7 +280,8 @@ pub async fn fork_and_prepare(
             c.disable_nonce_check = quick; // Disable nonce check in quick mode
         });
 
-    let mut evm = ctx.build_mainnet();
+    let mut mezo_precompile_inspector = MezoPrecompileMockInspector::default();
+    let mut evm = ctx.build_mainnet_with_inspector(&mut mezo_precompile_inspector);
     info!("The evm verision is {}", evm.cfg().spec);
 
     // Skip replaying preceding transactions if quick mode is enabled
@@ -310,17 +315,12 @@ pub async fn fork_and_prepare(
             let short_hash = &tx_hash.to_string()[2..10]; // Skip 0x, take 8 chars
             console_bar.set_message(format!("tx {}: 0x{}...", i + 1, short_hash));
 
-            debug!(
-                "Executing transaction {}/{}: {:?}",
-                i + 1,
-                preceding_txs.len(),
-                tx_hash
-            );
+            debug!("Executing transaction {}/{}: {:?}", i + 1, preceding_txs.len(), tx_hash);
 
             let tx_env = get_tx_env_from_tx(tx, chain_id)?;
 
             // Actually execute the transaction with commit
-            match evm.transact_commit(tx_env.clone()) {
+            match evm.inspect_tx_commit(tx_env.clone()) {
                 Ok(result) => match result {
                     ExecutionResult::Success { gas_used, .. } => {
                         console_bar.set_message(format!("✅ 0x{short_hash}... gas: {gas_used}"));
@@ -385,9 +385,7 @@ pub fn get_tx_env_from_tx(tx: &AnyRpcTransaction, chain_id: u64) -> Result<TxEnv
     let mut b = TxEnv::builder()
         .caller(tx.from())
         .gas_limit(tx.gas_limit())
-        .gas_price(
-            TransactionTrait::gas_price(tx).unwrap_or(TransactionTrait::max_fee_per_gas(tx)),
-        )
+        .gas_price(TransactionTrait::gas_price(tx).unwrap_or(TransactionTrait::max_fee_per_gas(tx)))
         .value(tx.value())
         .data(tx.input().to_owned())
         .gas_priority_fee(tx.max_priority_fee_per_gas())

@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, Log, TxHash, U256};
-use edb_common::EdbContext;
+use edb_common::{is_mezo_chain, EdbContext, MezoPrecompileMockInspector};
 use eyre::Result;
 use revm::{
     context::{
@@ -51,6 +51,7 @@ where
 {
     call_tracer: CallTracer,
     opcode_inspector: OpcodeSnapshotInspector<DB>,
+    mezo_precompile_inspector: MezoPrecompileMockInspector,
 }
 
 impl<DB> ReplayWithOpcodeInspector<DB>
@@ -67,7 +68,11 @@ where
         let mut opcode_inspector = OpcodeSnapshotInspector::new(ctx);
         opcode_inspector.with_excluded_addresses(excluded_addresses);
         opcode_inspector.with_significant_only(significant_only);
-        Self { call_tracer: CallTracer::new(), opcode_inspector }
+        Self {
+            call_tracer: CallTracer::new(),
+            opcode_inspector,
+            mezo_precompile_inspector: MezoPrecompileMockInspector::default(),
+        }
     }
 
     fn into_parts(self) -> (TraceReplayResult, OpcodeSnapshots<DB>) {
@@ -98,6 +103,7 @@ where
         self.call_tracer
             .call(context, inputs)
             .or_else(|| self.opcode_inspector.call(context, inputs))
+            .or_else(|| self.mezo_precompile_inspector.call(context, inputs))
     }
 
     fn call_end(
@@ -155,8 +161,8 @@ where
 {
     info!("Replaying transaction to collect call trace and touched addresses");
 
-    let mut tracer = CallTracer::new();
-    let mut evm = ctx.build_mainnet_with_inspector(&mut tracer);
+    let mut inspector = (CallTracer::new(), MezoPrecompileMockInspector::default());
+    let mut evm = ctx.build_mainnet_with_inspector(&mut inspector);
 
     let exec_result = evm
         .inspect_one_tx(tx)
@@ -175,7 +181,8 @@ where
         }
     }
 
-    let mut result = tracer.into_replay_result();
+    drop(evm);
+    let mut result = inspector.0.into_replay_result();
 
     // Set the total gas used on the trace (includes gas refunds from SSTORE, etc.)
     if let Some(gas) = gas_used {
@@ -290,28 +297,14 @@ where
 {
     info!("Tweaking bytecode");
 
+    let chain_id = ctx.cfg.chain_id;
+    let allow_direct_runtime_tweak = is_mezo_chain(chain_id);
     let mut tweaker =
         CodeTweaker::new(ctx, config.rpc_proxy_url.clone(), config.etherscan_api_key.clone());
 
     let mut contracts_in_tx = Vec::new();
 
     for (address, recompiled_artifact) in recompiled_artifacts {
-        let creation_tx_hash = match tweaker.get_creation_tx(address).await {
-            Ok(hash) => hash,
-            Err(e) => {
-                warn!(
-                    "Failed to get creation tx for contract {address}: {e}. \
-                     This contract will use opcode-level traces instead of source-level debugging."
-                );
-                continue;
-            }
-        };
-        if creation_tx_hash == tx_hash {
-            debug!("Skip tweaking contract {}, since it was created by the transaction under investigation", address);
-            contracts_in_tx.push(*address);
-            continue;
-        }
-
         let artifact = match artifacts.get(address) {
             Some(a) => a,
             None => {
@@ -322,6 +315,39 @@ where
                 continue;
             }
         };
+
+        let creation_tx_hash = match tweaker.get_creation_tx(address).await {
+            Ok(hash) => hash,
+            Err(e) => {
+                if allow_direct_runtime_tweak {
+                    warn!(
+                        "Failed to get creation tx for Mezo contract {address}: {e}. \
+                         Falling back to direct runtime bytecode replacement."
+                    );
+                    match tweaker.tweak_deployed_runtime(address, artifact, recompiled_artifact) {
+                        Ok(()) => {}
+                        Err(runtime_err) => {
+                            warn!(
+                                "Direct runtime bytecode replacement failed for contract {address}: \
+                                 {runtime_err}. This contract will use opcode-level traces instead \
+                                 of source-level debugging."
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Failed to get creation tx for contract {address}: {e}. \
+                         This contract will use opcode-level traces instead of source-level debugging."
+                    );
+                }
+                continue;
+            }
+        };
+        if creation_tx_hash == tx_hash {
+            debug!("Skip tweaking contract {}, since it was created by the transaction under investigation", address);
+            contracts_in_tx.push(*address);
+            continue;
+        }
 
         let tweak_result = if config.quick {
             match tweaker.tweak(address, artifact, recompiled_artifact, true).await {

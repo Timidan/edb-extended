@@ -316,6 +316,10 @@ pub struct TraceEntry {
     pub self_destruct: Option<(Address, U256)>,
     /// Events
     pub events: Vec<LogData>,
+    /// Emitter address for each event, by index. Skipped in raw trace JSON
+    /// because the legacy `events` field serializes only log data.
+    #[serde(skip)]
+    pub event_addresses: Vec<Address>,
     /// The first snapshot id that belongs to this entry
     pub first_snapshot_id: Option<usize>,
 }
@@ -710,6 +714,7 @@ mod tests {
             target_label: Some("TestContract".to_string()),
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: Some(42),
         };
 
@@ -765,6 +770,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         });
 
@@ -850,6 +856,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         };
 
@@ -886,6 +893,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         };
         let entry2 = TraceEntry {
@@ -906,6 +914,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         };
 
@@ -955,6 +964,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         });
 
@@ -978,6 +988,7 @@ mod tests {
                 target_label: None,
                 self_destruct: None,
                 events: vec![],
+                event_addresses: vec![],
                 first_snapshot_id: None,
             });
         }
@@ -1027,6 +1038,7 @@ mod tests {
                 target_label: Some(format!("Entry{i}")),
                 self_destruct: None,
                 events: vec![],
+                event_addresses: vec![],
                 first_snapshot_id: Some(i),
             });
         }
@@ -1066,6 +1078,7 @@ mod tests {
             target_label: None,
             self_destruct: None,
             events: vec![event_data.clone()],
+            event_addresses: vec![Address::ZERO],
             first_snapshot_id: None,
         };
 
@@ -1101,6 +1114,7 @@ mod tests {
                 U256::from(1000),
             )),
             events: vec![],
+            event_addresses: vec![],
             first_snapshot_id: None,
         };
 

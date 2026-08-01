@@ -63,6 +63,8 @@ pub use disasm::*;
 mod etherscan;
 pub use etherscan::*;
 
+pub mod blockscout;
+
 mod compilation;
 pub use compilation::*;
 

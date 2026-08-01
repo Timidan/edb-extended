@@ -309,7 +309,12 @@ where
                         topics.push(serde_json::Value::String(format!("{topic_val:#066x}")));
                     }
                 }
-                Some(RenderedLogInfo { offset, size, topics })
+                Some(RenderedLogInfo {
+                    address: Some(format!("{target_address}")),
+                    offset,
+                    size,
+                    topics,
+                })
             } else {
                 None
             }

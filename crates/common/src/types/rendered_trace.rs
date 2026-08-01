@@ -91,6 +91,8 @@ pub struct RenderedLogArg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenderedLogInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     pub offset: String,
     pub size: String,
     pub topics: Vec<serde_json::Value>,

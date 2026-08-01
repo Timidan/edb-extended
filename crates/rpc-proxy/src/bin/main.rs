@@ -71,6 +71,11 @@ struct ServerArgs {
     #[arg(long)]
     rpc_urls: Option<String>,
 
+    /// Chain ID used to select built-in RPC defaults when --rpc-urls is omitted
+    /// Example: --chain-id 31611
+    #[arg(long)]
+    chain_id: Option<u64>,
+
     // ========== Cache Configuration ==========
     /// Maximum number of cached items
     #[arg(long, default_value = "1024000")]
@@ -159,6 +164,11 @@ async fn run_server(args: ServerArgs) -> Result<()> {
     // Set RPC URLs if provided
     if let Some(urls) = args.rpc_urls {
         builder = builder.rpc_urls_str(&urls);
+    }
+
+    // Set default chain if provided
+    if let Some(chain_id) = args.chain_id {
+        builder = builder.chain_id(chain_id);
     }
 
     // Set cache directory if provided

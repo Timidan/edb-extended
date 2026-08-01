@@ -239,7 +239,12 @@ pub async fn fetch_artifact_from_sourcify(
         let metadata: EtherscanMetadata =
             serde_json::from_value(synth).context("synthesize metadata")?;
 
-        let artifact = Artifact { meta: metadata, input, output };
+        let artifact = Artifact {
+            meta: metadata,
+            input,
+            output,
+            source_provider: Some("sourcify".to_string()),
+        };
         return Ok(Some(artifact));
     }
 
