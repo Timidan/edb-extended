@@ -1,0 +1,8 @@
+{
+  "name": "edb-bridge-scripts",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ws": "8.21.1"
+  }
+}
