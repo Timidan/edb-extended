@@ -7,7 +7,6 @@
 // =============================================================================
 
 import http from "node:http";
-import { freemem, totalmem } from "node:os";
 
 import {
   PORT,
@@ -27,6 +26,7 @@ import {
 } from "./bridge-config.mjs";
 
 import { redactRpcUrl } from "./bridge-security.mjs";
+import { readMemorySnapshot } from "./cgroup-memory.mjs";
 import { sendJson } from "./http-compression.mjs";
 
 import {
@@ -155,6 +155,7 @@ const server = http.createServer(async (req, res) => {
   // Health check
   if (req.method === "GET" && url === "/health") {
     pruneTraceDetailStore();
+    const memorySnapshot = readMemorySnapshot();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
@@ -173,8 +174,9 @@ const server = http.createServer(async (req, res) => {
         queueTimeoutMs: SIMULATION_QUEUE_TIMEOUT_MS,
       },
       memory: {
-        totalMB: Math.round(totalmem() / (1024 * 1024)),
-        freeMB: Math.round(freemem() / (1024 * 1024)),
+        totalMB: Math.round(memorySnapshot.totalBytes / (1024 * 1024)),
+        freeMB: Math.round(memorySnapshot.freeBytes / (1024 * 1024)),
+        source: memorySnapshot.source,
         pressureThresholdMB: MEMORY_PRESSURE_THRESHOLD_MB,
         hardLimitMB: MEMORY_PRESSURE_HARD_LIMIT_MB,
       },
@@ -669,8 +671,9 @@ server.listen(PORT, () => {
   console.log(`  POST /heimdall/version   - Check Heimdall availability`);
   console.log(`  POST /heimdall/decompile - Decompile bytecode / address via Heimdall`);
   console.log(`  POST /heimdall/dump      - Storage dump via Heimdall`);
+  const startupMemory = readMemorySnapshot();
   console.log(`[simulator-bridge] concurrency: max=${MAX_CONCURRENT_SIMULATIONS} processes, queue=${SIMULATION_QUEUE_MAX}, queue_timeout=${SIMULATION_QUEUE_TIMEOUT_MS}ms`);
-  console.log(`[simulator-bridge] memory-pressure: evict_threshold=${MEMORY_PRESSURE_THRESHOLD_MB}MB, hard_limit=${MEMORY_PRESSURE_HARD_LIMIT_MB}MB, system_total=${Math.round(totalmem() / (1024 * 1024))}MB`);
+  console.log(`[simulator-bridge] memory-pressure: evict_threshold=${MEMORY_PRESSURE_THRESHOLD_MB}MB, hard_limit=${MEMORY_PRESSURE_HARD_LIMIT_MB}MB, effective_total=${Math.round(startupMemory.totalBytes / (1024 * 1024))}MB, source=${startupMemory.source}`);
   console.log(`[simulator-bridge] keep-alive: max_sessions=${KEEP_ALIVE_MAX_SESSIONS}, idle_ttl=${KEEP_ALIVE_IDLE_TTL_MS / 1000}s, sweep_interval=${KEEP_ALIVE_SWEEP_INTERVAL_MS / 1000}s`);
 });
 

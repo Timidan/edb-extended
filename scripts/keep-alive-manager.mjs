@@ -7,7 +7,7 @@ import http from "node:http";
 import { spawn, execSync } from "node:child_process";
 import { createWriteStream, readFileSync, unlinkSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
-import { tmpdir, freemem, totalmem } from "node:os";
+import { tmpdir } from "node:os";
 import {
   SIMULATOR_BINARY_PATH,
   KEEP_ALIVE_IDLE_TTL_MS,
@@ -22,6 +22,7 @@ import {
 } from "./bridge-config.mjs";
 import { redactRpcUrl } from "./bridge-security.mjs";
 import { terminatePidWithFallback, extractJsonFromOutputInternal } from "./simulation-runner.mjs";
+import { readMemorySnapshot } from "./cgroup-memory.mjs";
 
 /**
  * @typedef {Object} KeepAliveSession
@@ -48,8 +49,8 @@ export const keepAliveSessions = new Map();
  * @returns {SimulationCapacityError|null}
  */
 export function checkMemoryPressure() {
-  const freeMemMB = freemem() / (1024 * 1024);
-  const totalMemMB = totalmem() / (1024 * 1024);
+  const initialMemory = readMemorySnapshot();
+  const freeMemMB = initialMemory.freeBytes / (1024 * 1024);
 
   if (freeMemMB >= MEMORY_PRESSURE_THRESHOLD_MB) return null;
 
@@ -62,19 +63,21 @@ export function checkMemoryPressure() {
     for (const session of sessionsByIdle) {
       endKeepAliveSession(session.sessionId);
       evicted++;
-      const nowFree = freemem() / (1024 * 1024);
+      const nowFree = readMemorySnapshot().freeBytes / (1024 * 1024);
       if (nowFree >= MEMORY_PRESSURE_THRESHOLD_MB) break;
     }
     if (evicted > 0) {
+      const memoryAfterEviction = readMemorySnapshot();
       console.log(
         `[simulator-bridge] memory pressure: evicted ${evicted} idle keep-alive session(s) ` +
-        `(free: ${freeMemMB.toFixed(0)}MB → ${(freemem() / (1024 * 1024)).toFixed(0)}MB / ${totalMemMB.toFixed(0)}MB total)`,
+        `(free: ${freeMemMB.toFixed(0)}MB → ${(memoryAfterEviction.freeBytes / (1024 * 1024)).toFixed(0)}MB / ` +
+        `${(memoryAfterEviction.totalBytes / (1024 * 1024)).toFixed(0)}MB total, ${memoryAfterEviction.source})`,
       );
     }
   }
 
   // Hard limit — still too low after eviction
-  const freeAfterMB = freemem() / (1024 * 1024);
+  const freeAfterMB = readMemorySnapshot().freeBytes / (1024 * 1024);
   if (freeAfterMB < MEMORY_PRESSURE_HARD_LIMIT_MB) {
     return new SimulationCapacityError(
       `Server memory critically low: ${freeAfterMB.toFixed(0)}MB free (need ${MEMORY_PRESSURE_HARD_LIMIT_MB}MB). ` +
